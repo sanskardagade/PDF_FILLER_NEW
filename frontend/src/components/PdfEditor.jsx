@@ -10,7 +10,7 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { loadDoc, saveDoc, uploadPdfBlob, uploadImageBlob } from "../api/docApi";
 
-const SOCKET_URL = import.meta.env.VITE_API_BASE || "http://localhost:4000";
+const SOCKET_URL = import.meta.env.VITE_API_BASE || "https://pdf-filler-new.onrender.com";
 
 // small throttle helper so drag updates don't spam
 const throttle = (fn, ms=30) => {
