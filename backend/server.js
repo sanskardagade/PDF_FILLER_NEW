@@ -11,7 +11,13 @@ import { Server as SocketIOServer } from "socket.io";
 const docs = new Map();
 
 const app = express();
-app.use(cors());
+
+// CORS configuration - allow frontend from environment or all origins
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
+app.use(cors({
+  origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN,
+  credentials: true
+}));
 app.use(express.json());
 
 // Ensure uploads directory exists and serve static files
@@ -65,8 +71,15 @@ app.post("/api/files/upload", upload.single("file"), (req, res) => {
 });
 
 const server = http.createServer(app);
+
+// Socket.IO CORS - allow frontend from environment or all origins
+const SOCKET_ORIGIN = process.env.CLIENT_ORIGIN;
+const socketCors = SOCKET_ORIGIN 
+  ? { origin: SOCKET_ORIGIN, methods: ["GET", "POST"], credentials: true }
+  : { origin: true, methods: ["GET", "POST"], credentials: true };
+
 const io = new SocketIOServer(server, {
-  cors: { origin: /localhost|127\.0\.0\.1|\[::1\]/, methods: ["GET", "POST"] },
+  cors: socketCors,
 });
 
 io.on("connection", (socket) => {
