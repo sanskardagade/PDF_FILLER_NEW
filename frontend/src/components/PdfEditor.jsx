@@ -11,6 +11,7 @@ import 'react-pdf/dist/Page/TextLayer.css';
 import { loadDoc, saveDoc, uploadPdfBlob, uploadImageBlob } from "../api/docApi";
 
 const SOCKET_URL = import.meta.env.VITE_API_BASE || "https://pdf-filler-new.onrender.com";
+const DEFAULT_PAGE_SIZE = { width: 595, height: 842 };
 
 // small throttle helper so drag updates don't spam
 const throttle = (fn, ms=30) => {
@@ -37,11 +38,11 @@ export default function PdfEditor({ fileUrl, docId }) {
   const [editedUrl, setEditedUrl] = useState(null); // Updated PDF fileUrl
   const [showTextEdit, setShowTextEdit] = useState(false);
   const [editText, setEditText] = useState("");
-  const [pdfTextItems, setPdfTextItems] = useState([]); // PDF text with positions, for the current page
+  const [pdfTextItems, setPdfTextItems] = useState({}); // PDF text with positions by page
   const [editBlock, setEditBlock] = useState(null); // {item, idx}
   const [boldToggle, setBoldToggle] = useState(false);
   const inlineEditorRef = useRef(null);
-  const [pageSize, setPageSize] = useState({ width: 595, height: 842 });
+  const [pageSizes, setPageSizes] = useState({ 1: DEFAULT_PAGE_SIZE });
   const [docVersion, setDocVersion] = useState(0);
   const [fontSizeInput, setFontSizeInput] = useState(12);
   const [fontColorHex, setFontColorHex] = useState('#000000');
@@ -51,6 +52,9 @@ export default function PdfEditor({ fileUrl, docId }) {
   const [selectedImageFile, setSelectedImageFile] = useState(null);
   const imageInputRef = useRef(null);
   const textBoxRefs = useRef({});
+  const caretPositionsRef = useRef({});
+  const [activeBoxId, setActiveBoxId] = useState(null);
+  const activeBoxIdRef = useRef(null);
 
   // Ensure we always have valid PDF bytes for pdf-lib
   async function ensurePdfBytes() {
@@ -146,7 +150,8 @@ export default function PdfEditor({ fileUrl, docId }) {
     setImages({});
     setNumPages(null);
     setEditedUrl(null); // Reset edited file
-    setPdfTextItems([]); // Reset when file changes
+    setPdfTextItems({}); // Reset when file changes
+    setPageSizes({ 1: DEFAULT_PAGE_SIZE });
     setEditBlock(null);
     // Fetch as ArrayBuffer and normalize to Uint8Array for pdf-lib usage
     if (fileUrl) {
@@ -156,7 +161,7 @@ export default function PdfEditor({ fileUrl, docId }) {
         // Clone bytes for history to avoid detached ArrayBuffer issues
         setHistory([{ bytes: new Uint8Array(bytes), url: fileUrl || null }]);
         setHistoryIndex(0);
-        extractTextItems(bytes, 1); // For now: just page 1
+        extractTextItems(bytes, 'all');
       });
     }
   }, [fileUrl]);
@@ -168,7 +173,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     fetch(editedUrl).then(res => res.arrayBuffer()).then(buf => {
       const bytes = new Uint8Array(buf);
       setPdfBuffer(bytes);
-      extractTextItems(bytes, 1);
+      extractTextItems(bytes, 'all');
     }).catch(() => {});
   }, [editedUrl]);
 
@@ -176,65 +181,73 @@ export default function PdfEditor({ fileUrl, docId }) {
   async function extractTextItems(pdfArrayBuffer, pageNum=1) {
     // Use the same worker version already set from pdfjs-dist import above
     const pdf = await pdfjsLib.getDocument({ data: pdfArrayBuffer }).promise;
-    const page = await pdf.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 1 });
-    setPageSize({ width: viewport.width, height: viewport.height });
-    const textContent = await page.getTextContent();
-    
-    // Get operators to extract color information
-    const ops = await page.getOperatorList();
-    let currentColor = { r: 0, g: 0, b: 0 }; // Default black
-    
-    // Parse operators to find color
+    const targets = pageNum === 'all'
+      ? Array.from({ length: pdf.numPages }, (_, idx) => idx + 1)
+      : Array.isArray(pageNum) ? pageNum : [pageNum];
+
+    const itemsByPage = {};
+    const sizesByPage = {};
+
     // Normalize color values to 0-1 range for consistent storage
     const normalizeColorValue = (val) => {
       const num = typeof val === 'number' ? val : parseFloat(val);
       if (isNaN(num)) return 0;
-      // PDF colors are typically in 0-1 range, but ensure they are
       return Math.max(0, Math.min(1, num));
     };
-    
-    for (let i = 0; i < ops.fnArray.length; i++) {
-      const op = ops.fnArray[i];
-      if (op === pdfjsLib.OPS.setFillRGBColor && ops.argsArray[i] && ops.argsArray[i].length >= 3) {
-        currentColor = {
-          r: normalizeColorValue(ops.argsArray[i][0]),
-          g: normalizeColorValue(ops.argsArray[i][1]),
-          b: normalizeColorValue(ops.argsArray[i][2])
-        };
-      } else if (op === pdfjsLib.OPS.setFillGrayColor && ops.argsArray[i] && ops.argsArray[i].length >= 1) {
-        const gray = normalizeColorValue(ops.argsArray[i][0]);
-        currentColor = { r: gray, g: gray, b: gray };
-      } else if (op === pdfjsLib.OPS.setFillColorSpace && ops.argsArray[i]) {
-        // Reset to default when color space changes
-        currentColor = { r: 0, g: 0, b: 0 };
+
+    for (const targetPage of targets) {
+      const page = await pdf.getPage(targetPage);
+      const viewport = page.getViewport({ scale: 1 });
+      sizesByPage[targetPage] = { width: viewport.width, height: viewport.height };
+      const textContent = await page.getTextContent();
+      const ops = await page.getOperatorList();
+      let currentColor = { r: 0, g: 0, b: 0 };
+
+      for (let i = 0; i < ops.fnArray.length; i++) {
+        const op = ops.fnArray[i];
+        if (op === pdfjsLib.OPS.setFillRGBColor && ops.argsArray[i] && ops.argsArray[i].length >= 3) {
+          currentColor = {
+            r: normalizeColorValue(ops.argsArray[i][0]),
+            g: normalizeColorValue(ops.argsArray[i][1]),
+            b: normalizeColorValue(ops.argsArray[i][2])
+          };
+        } else if (op === pdfjsLib.OPS.setFillGrayColor && ops.argsArray[i] && ops.argsArray[i].length >= 1) {
+          const gray = normalizeColorValue(ops.argsArray[i][0]);
+          currentColor = { r: gray, g: gray, b: gray };
+        } else if (op === pdfjsLib.OPS.setFillColorSpace && ops.argsArray[i]) {
+          currentColor = { r: 0, g: 0, b: 0 };
+        }
       }
+
+      const items = textContent.items.map((item) => {
+        const [, , , d, e, f] = item.transform;
+        const fontName = item.fontName || 'Helvetica';
+        const isBold = /Bold|Semibold|Medium/gi.test(fontName);
+        const isItalic = /Italic|Oblique/gi.test(fontName);
+
+        return {
+          str: item.str,
+          x: e,
+          y: f,
+          fontSize: Math.abs(d),
+          width: item.width,
+          height: item.height,
+          fontName,
+          isBold,
+          isItalic,
+          color: currentColor,
+        };
+      });
+
+      itemsByPage[targetPage] = items;
     }
-    
-    // Map to [{str, x, y, width, height, fontName, fontSize, color}]
-    const items = textContent.items.map((item, idx) => {
-      const [, , , d, e, f] = item.transform;
-      
-      // Try to extract color from operators (simplified - uses last color before this text)
-      // In practice, we'll need to match operators to text items more precisely
-      const fontName = item.fontName || 'Helvetica';
-      const isBold = /Bold|Semibold|Medium/gi.test(fontName);
-      const isItalic = /Italic|Oblique/gi.test(fontName);
-      
-      return {
-        str: item.str,
-        x: e,
-        y: f,
-        fontSize: Math.abs(d),
-        width: item.width,
-        height: item.height,
-        fontName: fontName,
-        isBold,
-        isItalic,
-        color: currentColor, // Will be improved
-      };
-    });
-    setPdfTextItems(items);
+
+    if (Object.keys(sizesByPage).length) {
+      setPageSizes(prev => ({ ...prev, ...sizesByPage }));
+    }
+    if (Object.keys(itemsByPage).length) {
+      setPdfTextItems(prev => ({ ...prev, ...itemsByPage }));
+    }
   }
   
   // Helper to convert RGB color to hex
@@ -281,7 +294,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     }
     setShowTextEdit(false);
     setEditText("");
-    await extractTextItems(newBytes, 1);
+    await extractTextItems(newBytes, 'all');
   }
 
   // Inline save of edited block (cover old, write new) with original font, size, and color
@@ -394,7 +407,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     }
     setEditBlock(null);
     // Re-extract to refresh clickable zones
-    await extractTextItems(newBytes, 1);
+    await extractTextItems(newBytes, 'all');
   }
 
   // Convert #RRGGBB to 0..1 rgb for pdf-lib
@@ -429,7 +442,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     const url = URL.createObjectURL(new Blob([clonedBytes], { type: 'application/pdf' }));
     setEditedUrl(url);
     setDocVersion(v => v + 1);
-    extractTextItems(clonedBytes, 1);
+    extractTextItems(clonedBytes, 'all');
   }
 
   function handleRedo() {
@@ -443,10 +456,195 @@ export default function PdfEditor({ fileUrl, docId }) {
     const url = URL.createObjectURL(new Blob([clonedBytes], { type: 'application/pdf' }));
     setEditedUrl(url);
     setDocVersion(v => v + 1);
-    extractTextItems(clonedBytes, 1);
+    extractTextItems(clonedBytes, 'all');
   }
 
-  const addTextBox = async (pageNumber, e, containerEl=null) => {
+  const getPageMetrics = (pageNumber) => {
+    if (pageSizes[pageNumber]) return pageSizes[pageNumber];
+    if (pageSizes[1]) return pageSizes[1];
+    return DEFAULT_PAGE_SIZE;
+  };
+
+  const getBoxDimensions = (fontSize) => {
+    const resolved = Math.max(6, fontSize || Number(fontSizeInput) || 12);
+    return {
+      width: Math.max(180, resolved * 10),
+      height: resolved + 8,
+    };
+  };
+
+  const placeCaret = (el, offset=null) => {
+    if (!el) return;
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    let targetNode = el.firstChild;
+    if (!targetNode) {
+      targetNode = document.createTextNode('');
+      el.appendChild(targetNode);
+    }
+    const textLength = targetNode.textContent?.length || 0;
+    const caretOffset = offset === null ? textLength : Math.min(Math.max(0, offset), textLength);
+    try {
+      range.setStart(targetNode, caretOffset);
+    } catch {
+      range.setStart(targetNode, textLength);
+    }
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  const rememberCaret = (boxId, offset) => {
+    caretPositionsRef.current[boxId] = offset;
+  };
+
+  const restoreCaret = (boxId, fallbackToEnd=true) => {
+    const el = textBoxRefs.current[boxId];
+    if (!el) return;
+    const stored = caretPositionsRef.current[boxId];
+    if (stored == null && !fallbackToEnd) return;
+    const offset = stored == null ? null : stored;
+    placeCaret(el, offset);
+  };
+
+  const focusNewTextBox = (boxId) => {
+    setTimeout(() => {
+      const textBoxEl = textBoxRefs.current[boxId];
+      if (textBoxEl) {
+        textBoxEl.setAttribute('dir', 'ltr');
+        textBoxEl.style.direction = 'ltr';
+        textBoxEl.style.textAlign = 'left';
+        textBoxEl.style.unicodeBidi = 'plaintext';
+        textBoxEl.style.writingMode = 'horizontal-tb';
+        if (textBoxEl.textContent === "Type..." || !textBoxEl.textContent?.trim()) {
+          textBoxEl.textContent = "";
+          setBoxes(prev => {
+            const copy = { ...prev };
+            for (const page of Object.keys(copy)) {
+              copy[page] = copy[page].map(b => b.id === boxId ? { ...b, text: "" } : b);
+            }
+            return copy;
+          });
+        }
+        textBoxEl.focus();
+        placeCaret(textBoxEl, null);
+        rememberCaret(boxId, null);
+      }
+    }, 50);
+  };
+
+  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text }) => {
+    const resolvedFontSize = Math.max(6, fontSize || Number(fontSizeInput) || 12);
+    const dims = getBoxDimensions(resolvedFontSize);
+    const boxWidth = width || dims.width;
+    const boxHeight = height || dims.height;
+    const wrap = wrapperRefs.current[pageNumber];
+    const maxWidth = wrap?.clientWidth || boxWidth;
+    const maxHeight = wrap?.clientHeight || boxHeight;
+    const normalizedLeft = Math.min(Math.max(0, left - boxWidth / 2), Math.max(0, maxWidth - boxWidth));
+    const normalizedTop = Math.min(Math.max(0, top - (boxHeight * 0.75)), Math.max(0, maxHeight - boxHeight));
+    const box = {
+      id: crypto.randomUUID(),
+      left: normalizedLeft,
+      top: normalizedTop,
+      width: boxWidth,
+      height: boxHeight,
+      text: text ?? "Type...",
+      fontSize: resolvedFontSize,
+      color: color || fontColorHex,
+      isBold: typeof isBold === "boolean" ? isBold : boldToggle,
+    };
+    setBoxes(prev => ({ ...prev, [pageNumber]: [...(prev[pageNumber] || []), box] }));
+    socketRef.current?.emit("add_box", { docId, pageNumber, box });
+    focusNewTextBox(box.id);
+    return box;
+  };
+
+  const isPointInExistingContent = (pageNumber, left, top) => {
+    const pageBoxes = boxes[pageNumber] || [];
+    const hitBox = pageBoxes.some(b => (
+      left >= b.left && left <= b.left + b.width &&
+      top >= b.top && top <= b.top + b.height
+    ));
+    if (hitBox) return true;
+
+    const items = pdfTextItems[pageNumber] || [];
+    if (!items.length) return false;
+    const metrics = getPageMetrics(pageNumber);
+    return items.some(item => {
+      const txtLeft = item.x * scale;
+      const txtTop = (metrics.height - item.y) * scale;
+      const txtWidth = (item.width || (item.fontSize || 12)) * scale;
+      const txtHeight = (item.height || item.fontSize || 12) * scale;
+      return (
+        left >= txtLeft && left <= txtLeft + txtWidth &&
+        top >= txtTop && top <= txtTop + txtHeight
+      );
+    });
+  };
+
+  const inferFontStyleFromNearbyText = (pageNumber, left, top) => {
+    const items = pdfTextItems[pageNumber] || pdfTextItems[1] || [];
+    if (!items.length) {
+      return {
+        fontSize: Number(fontSizeInput) || 12,
+        color: fontColorHex,
+        isBold: boldToggle,
+      };
+    }
+    const metrics = getPageMetrics(pageNumber);
+    let closest = null;
+    let minDistance = Infinity;
+    items.forEach(item => {
+      const txtLeft = item.x * scale;
+      const txtTop = (metrics.height - item.y) * scale;
+      const txtWidth = (item.width || (item.fontSize || 12)) * scale;
+      const txtHeight = (item.height || item.fontSize || 12) * scale;
+      const centerX = txtLeft + txtWidth / 2;
+      const centerY = txtTop + txtHeight / 2;
+      const distance = Math.hypot(centerX - left, centerY - top);
+      if (distance < minDistance) {
+        minDistance = distance;
+        closest = item;
+      }
+    });
+    if (!closest) {
+      return {
+        fontSize: Number(fontSizeInput) || 12,
+        color: fontColorHex,
+        isBold: boldToggle,
+      };
+    }
+    return {
+      fontSize: closest.fontSize || Number(fontSizeInput) || 12,
+      color: closest.color ? rgbToHex(closest.color.r, closest.color.g, closest.color.b) : fontColorHex,
+      isBold: !!closest.isBold,
+    };
+  };
+
+  const handleQuickAddTextBox = (pageNumber, e) => {
+    if (tool !== "select") return;
+    const wrap = wrapperRefs.current[pageNumber];
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const left = e.clientX - rect.left;
+    const top = e.clientY - rect.top;
+    if (isPointInExistingContent(pageNumber, left, top)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const style = inferFontStyleFromNearbyText(pageNumber, left, top);
+    createTextBox({
+      pageNumber,
+      left,
+      top,
+      fontSize: style.fontSize,
+      color: style.color,
+      isBold: style.isBold,
+    });
+  };
+
+  const addTextBox = (pageNumber, e, containerEl=null) => {
     if (tool !== "text") return;
     e.stopPropagation();
     const wrap = containerEl || wrapperRefs.current[pageNumber];
@@ -455,36 +653,14 @@ export default function PdfEditor({ fileUrl, docId }) {
     const left = e.clientX - rect.left;
     const top  = e.clientY - rect.top;
 
-    const fontSize = Number(fontSizeInput) || 12;
-    const box = {
-      id: crypto.randomUUID(),
-      left, 
-      top, 
-      width: 180, 
-      height: fontSize + 8, // Height based on font size
-      text: "Type...",
-      fontSize,
+    createTextBox({
+      pageNumber,
+      left,
+      top,
+      fontSize: Number(fontSizeInput) || 12,
       color: fontColorHex,
       isBold: boldToggle,
-    };
-
-    setBoxes(prev => ({ ...prev, [pageNumber]: [...(prev[pageNumber]||[]), box] }));
-    socketRef.current?.emit("add_box", { docId, pageNumber, box });
-    
-    // Auto-focus the new text box
-    setTimeout(() => {
-      const textBoxEl = textBoxRefs.current[box.id];
-      if (textBoxEl) {
-        textBoxEl.focus();
-        // Select the placeholder text
-        const range = document.createRange();
-        range.selectNodeContents(textBoxEl);
-        range.collapse(false);
-        const sel = window.getSelection();
-        sel.removeAllRanges();
-        sel.addRange(range);
-      }
-    }, 50);
+    });
   };
 
   const updateBox = throttle((pageNumber, boxId, patch) => {
@@ -620,7 +796,7 @@ export default function PdfEditor({ fileUrl, docId }) {
         pushHistory(newBytes, url);
         setDocVersion(v => v + 1);
       }
-      await extractTextItems(newBytes, 1);
+      await extractTextItems(newBytes, 'all');
     } catch (err) {
       console.error('Failed to embed all content:', err);
     }
@@ -790,7 +966,7 @@ export default function PdfEditor({ fileUrl, docId }) {
         pushHistory(newBytes, url);
         setDocVersion(v => v + 1);
       }
-      await extractTextItems(newBytes, 1);
+      await extractTextItems(newBytes, 'all');
     } catch (err) {
       console.error('Failed to embed image:', err);
       alert('Failed to embed image in PDF: ' + err.message);
@@ -881,7 +1057,7 @@ export default function PdfEditor({ fileUrl, docId }) {
         pushHistory(newBytes, url);
         setDocVersion(v => v + 1);
       }
-      await extractTextItems(newBytes, 1);
+      await extractTextItems(newBytes, 'all');
     } catch (err) {
       console.error('Failed to re-embed images:', err);
     }
@@ -956,7 +1132,7 @@ export default function PdfEditor({ fileUrl, docId }) {
           pushHistory(newBytes, url);
           setDocVersion(v => v + 1);
         }
-        await extractTextItems(newBytes, 1);
+        await extractTextItems(newBytes, 'all');
         return;
       }
       
@@ -1017,7 +1193,7 @@ export default function PdfEditor({ fileUrl, docId }) {
         pushHistory(newBytes, url);
         setDocVersion(v => v + 1);
       }
-      await extractTextItems(newBytes, 1);
+      await extractTextItems(newBytes, 'all');
     } catch (err) {
       console.error('Failed to rebuild PDF with images:', err);
     }
@@ -1082,6 +1258,10 @@ export default function PdfEditor({ fileUrl, docId }) {
     }
   }, [editBlock]);
 
+  useEffect(() => {
+    activeBoxIdRef.current = activeBoxId;
+  }, [activeBoxId]);
+
   // Intentionally do not bind to native text layer clicks.
   // We open editors only via our invisible overlay rectangles, which
   // are derived from pdf.js text extraction and thus have stable
@@ -1140,6 +1320,7 @@ export default function PdfEditor({ fileUrl, docId }) {
             key={`page_${i+1}`}
             className="pageWrap"
             ref={(el) => (wrapperRefs.current[i+1] = el)}
+            onDoubleClick={(e) => handleQuickAddTextBox(i + 1, e)}
             onClick={(e) => {
               if (tool === "text") {
                 addTextBox(i + 1, e);
@@ -1156,12 +1337,13 @@ export default function PdfEditor({ fileUrl, docId }) {
               renderTextLayer={false}
             />
 
-            {/* Inline editor overlay for real text blocks (page 1 demo) */}
-            {i === 0 && pdfTextItems.map((item, idx) => {
-              const topPx = (pageSize.height - item.y) * scale;
+            {/* Inline editor overlay for real text blocks */}
+            {(pdfTextItems[i+1] || []).map((item, idx) => {
+              const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
+              const topPx = (pageMetrics.height - item.y) * scale;
               const leftPx = item.x * scale;
               const heightPx = (item.height || item.fontSize) * scale;
-              const widthPx = item.width * scale;
+              const widthPx = (item.width || item.fontSize || 12) * scale;
               const isThisEditing = editBlock && editBlock.idx === idx;
               return (
                 <div key={idx}>
@@ -1190,6 +1372,7 @@ export default function PdfEditor({ fileUrl, docId }) {
                       ref={inlineEditorRef}
                       contentEditable
                       suppressContentEditableWarning
+                      dir="ltr"
                       style={{
                         position: 'absolute',
                         left: leftPx,
@@ -1197,7 +1380,8 @@ export default function PdfEditor({ fileUrl, docId }) {
                         minWidth: widthPx,
                         minHeight: heightPx,
                         outline: '2px dashed #1976d2',
-                        background: 'rgba(255,255,255,0.8)',
+                        // background: 'rgba(255,255,255,0.8)',
+                        background: 'transparent',
                         fontSize: item.fontSize * scale,
                         lineHeight: 1.1,
                         fontWeight: item.isBold ? 700 : 400,
@@ -1206,6 +1390,11 @@ export default function PdfEditor({ fileUrl, docId }) {
                         color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
                         padding: '2px 4px',
                         zIndex: 35,
+                        direction: 'ltr',
+                        textAlign: 'left',
+                        unicodeBidi: 'plaintext',
+                        whiteSpace: 'pre-wrap',
+                        writingMode: 'horizontal-tb',
                       }}
                       onBlur={(e)=>{
                         const val = e.currentTarget.textContent || item.str;
@@ -1375,6 +1564,7 @@ export default function PdfEditor({ fileUrl, docId }) {
                   key={b.id}
                   ref={(el) => { if (el) textBoxRefs.current[b.id] = el; }}
                   className="text-box"
+                  dir="ltr"
                   style={{
                     position: 'absolute',
                     left:b.left, 
@@ -1388,16 +1578,32 @@ export default function PdfEditor({ fileUrl, docId }) {
                     fontWeight: boxIsBold ? 700 : 400,
                     color: boxColor,
                     fontFamily: 'Helvetica, Arial, sans-serif',
-                    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                    // backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                    backgroundColor: 'transparent',
                     outline: 'none',
                     cursor: 'text',
                     zIndex: 50,
+                    direction: 'ltr',
+                    textAlign: 'left',
+                    unicodeBidi: 'plaintext',
+                    whiteSpace: 'pre-wrap',
+                    writingMode: 'horizontal-tb',
                   }}
                   contentEditable
                   suppressContentEditableWarning
                   tabIndex={0}
-                  onFocus={() => lock(b.id)}
+                  onFocus={(e) => {
+                    setActiveBoxId(b.id);
+                    activeBoxIdRef.current = b.id;
+                    lock(b.id);
+                    const node = e.currentTarget.firstChild;
+                    const len = node?.textContent?.length || 0;
+                    rememberCaret(b.id, len);
+                    restoreCaret(b.id);
+                  }}
                   onBlur={async () => {
+                    setActiveBoxId(cur => (cur === b.id ? null : cur));
+                    activeBoxIdRef.current = null;
                     unlock(b.id);
                     // Embed text box into PDF when done editing
                     const finalText = textBoxRefs.current[b.id]?.textContent || "";
@@ -1443,11 +1649,21 @@ export default function PdfEditor({ fileUrl, docId }) {
                     window.addEventListener("mouseup", up);
                   }}
                   onInput={(e) => {
+                    const selection = window.getSelection();
+                    if (selection && selection.rangeCount > 0) {
+                      try {
+                        const range = selection.getRangeAt(0);
+                        rememberCaret(b.id, range.endOffset);
+                      } catch {}
+                    }
                     const pageBoxes = boxes[i + 1] || [];
                     const idx = pageBoxes.findIndex(x => x.id === b.id);
                     const clone = [...pageBoxes];
                     clone[idx] = { ...clone[idx], text: e.currentTarget.textContent || "" };
                     setBoxes(prev => ({ ...prev, [i + 1]: clone }));
+                    requestAnimationFrame(() => {
+                      if (activeBoxIdRef.current === b.id) restoreCaret(b.id, false);
+                    });
                   }}
                 >
                   {b.text}
