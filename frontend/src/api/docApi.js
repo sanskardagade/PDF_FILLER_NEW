@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "https://pdf-filler-new.onrender.com";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:4000";
 
 export async function loadDoc(docId) {
   const res = await fetch(`${API_BASE}/doc/${encodeURIComponent(docId)}`);
