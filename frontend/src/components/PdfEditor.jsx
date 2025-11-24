@@ -30,6 +30,7 @@ const throttle = (fn, ms=30) => {
 export default function PdfEditor({ fileUrl, docId }) {
   const [numPages, setNumPages] = useState(null);
   const [scale, setScale] = useState(1.2);
+  const [autoFitEnabled, setAutoFitEnabled] = useState(true);
   const [tool, setTool] = useState("select");
   const [boxes, setBoxes] = useState({});
   const wrapperRefs = useRef({});
@@ -153,6 +154,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     setPdfTextItems({}); // Reset when file changes
     setPageSizes({ 1: DEFAULT_PAGE_SIZE });
     setEditBlock(null);
+    setAutoFitEnabled(true);
     // Fetch as ArrayBuffer and normalize to Uint8Array for pdf-lib usage
     if (fileUrl) {
       fetch(fileUrl).then(res => res.arrayBuffer()).then(buf => {
@@ -165,6 +167,26 @@ export default function PdfEditor({ fileUrl, docId }) {
       });
     }
   }, [fileUrl]);
+
+  // Auto-fit scale to wrapper width when a new document loads or page sizes change
+  useEffect(() => {
+    if (!autoFitEnabled) return;
+    if (!numPages) return;
+    // Prefer page 1 as representative
+    const wrap = wrapperRefs.current[1];
+    const metrics = pageSizes[1] || DEFAULT_PAGE_SIZE;
+    if (!wrap || !metrics || !metrics.width) return;
+    try {
+      const availableWidth = wrap.clientWidth || wrap.offsetWidth || window.innerWidth;
+      if (availableWidth <= 0) return;
+      const targetScale = availableWidth / metrics.width;
+      // Clamp to sensible bounds
+      const clamped = Math.min(2.0, Math.max(0.5, targetScale));
+      setScale(clamped);
+    } catch (err) {
+      // ignore
+    }
+  }, [numPages, pageSizes, autoFitEnabled, editedUrl, fileUrl]);
 
   // If we load an already-edited PDF from backend (editedUrl), fetch bytes so pdf-lib can edit
   useEffect(() => {
@@ -249,6 +271,34 @@ export default function PdfEditor({ fileUrl, docId }) {
       setPdfTextItems(prev => ({ ...prev, ...itemsByPage }));
     }
   }
+
+  // Sample the rendered page to get the background color under a text item.
+  // Returns {r,g,b} in 0..1 range or null on failure.
+  async function sampleBackgroundColorForItem(pageNumber, item) {
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+      if (pageNumber < 1 || pageNumber > pdf.numPages) return null;
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      // PDF item.x is in PDF units from left; item.y is baseline distance from bottom.
+      const x = Math.round(item.x);
+      const y = Math.round(viewport.height - item.y);
+      const px = Math.min(Math.max(0, x), canvas.width - 1);
+      const py = Math.min(Math.max(0, y), canvas.height - 1);
+      const data = ctx.getImageData(px, py, 1, 1).data; // [r,g,b,a]
+      if (!data || data.length < 3) return null;
+      return { r: data[0] / 255, g: data[1] / 255, b: data[2] / 255 };
+    } catch (err) {
+      return null;
+    }
+  }
   
   // Helper to convert RGB color to hex
   function rgbToHex(r, g, b) {
@@ -302,7 +352,8 @@ export default function PdfEditor({ fileUrl, docId }) {
     if (!editBlock) return;
     const bytes = await ensurePdfBytes();
     const pdfDoc = await PDFDocument.load(bytes);
-    const page = pdfDoc.getPages()[0];
+    const pageIndex = ((editBlock && editBlock.pageNumber) ? editBlock.pageNumber : 1) - 1;
+    const page = pdfDoc.getPages()[pageIndex];
 
     // Use original font properties - don't override with user inputs
     const item = editBlock.item;
@@ -368,14 +419,20 @@ export default function PdfEditor({ fileUrl, docId }) {
     const coverY = baselineY - (actualHeight * 0.2); // Small padding for descenders
     const coverHeight = actualHeight * 1.1; // Cover actual height plus small margin
     
-    // Draw a very precise white rectangle ONLY over the exact text area
-    // Make it tight to prevent covering tables/lines while fully covering old text
+    // Try to sample the page background color under the text and use that
+    // as the cover color. If sampling fails, fall back to white.
+    let coverColor = { r: 1, g: 1, b: 1 };
+    try {
+      const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, item);
+      if (sampled) coverColor = sampled;
+    } catch {}
+
     page.drawRectangle({
       x: item.x - 1, // Tiny left margin
       y: coverY,
       width: textWidth,
       height: coverHeight,
-      color: rgb(1, 1, 1), // White
+      color: rgb(coverColor.r, coverColor.g, coverColor.b),
       opacity: 1.0,
     });
 
@@ -408,6 +465,68 @@ export default function PdfEditor({ fileUrl, docId }) {
     setEditBlock(null);
     // Re-extract to refresh clickable zones
     await extractTextItems(newBytes, 'all');
+  }
+
+  // Delete inline PDF text by covering the original text area with white
+  // and saving the PDF. Mirrors the covering logic used when saving edits.
+  async function handleDeleteTextInline() {
+    if (!editBlock) return;
+    const item = editBlock.item;
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdfDoc = await PDFDocument.load(bytes);
+      const pageIndex = ((editBlock && editBlock.pageNumber) ? editBlock.pageNumber : 1) - 1;
+      const page = pdfDoc.getPages()[pageIndex];
+
+      // Determine original font size and metrics
+      const originalFontSize = item.fontSize || 12;
+      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+      const oldTextWidth = font.widthOfTextAtSize(item.str, originalFontSize);
+      const textWidth = oldTextWidth + 2;
+      const actualHeight = item.height || (originalFontSize * 0.7);
+      const baselineY = item.y;
+      const coverY = baselineY - (actualHeight * 0.2);
+      const coverHeight = actualHeight * 1.1;
+
+      // Sample background color and use that to cover the old text
+      let coverColor = { r: 1, g: 1, b: 1 };
+      try {
+        const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, item);
+        if (sampled) coverColor = sampled;
+      } catch {}
+
+      page.drawRectangle({
+        x: item.x - 1,
+        y: coverY,
+        width: textWidth,
+        height: coverHeight,
+        color: rgb(coverColor.r, coverColor.g, coverColor.b),
+        opacity: 1.0,
+      });
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes, pdfUrl: url });
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      setEditBlock(null);
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to delete inline text:', err);
+    }
   }
 
   // Convert #RRGGBB to 0..1 rgb for pdf-lib
@@ -679,19 +798,17 @@ export default function PdfEditor({ fileUrl, docId }) {
     try {
       const boxesToEmbed = boxesToUse || boxes;
       const imagesToEmbed = imagesToUse || images;
-      
-      // Always start from original PDF
-      const src = fileUrl;
-      if (!src) {
-        const fallbackSrc = editedUrl;
-        if (!fallbackSrc) return;
-        const ab = await fetch(fallbackSrc).then(r => r.arrayBuffer());
-        const bytes = new Uint8Array(ab);
-        const pdfDoc = await PDFDocument.load(bytes);
+      // Prefer the most-recent in-memory/edited PDF so previously-embedded
+      // text/images are preserved. Fall back to `editedUrl`, then the
+      // original `fileUrl` if needed.
+      if (pdfBuffer && pdfBuffer.length > 6) {
+        const pdfDoc = await PDFDocument.load(pdfBuffer);
         await embedAllContent(pdfDoc, boxesToEmbed, imagesToEmbed);
         return;
       }
-      
+
+      const src = editedUrl || fileUrl;
+      if (!src) return;
       const ab = await fetch(src).then(r => r.arrayBuffer());
       const bytes = new Uint8Array(ab);
       const pdfDoc = await PDFDocument.load(bytes);
@@ -1308,9 +1425,9 @@ export default function PdfEditor({ fileUrl, docId }) {
           Download PDF
         </button>
         <span style={{flex:1}}/>
-        <button onClick={() => setScale(s => Math.max(0.5, s-0.1))}>-</button>
+        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.max(0.5, s-0.1)); }}>-</button>
         <div style={{padding:"0 .5rem"}}>{Math.round(scale*100)}%</div>
-        <button onClick={() => setScale(s => Math.min(2.0, s+0.1))}>+</button>
+        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.min(2.0, s+0.1)); }}>+</button>
       </div>
       {/* removed standalone Add-to-PDF panel to simplify UX for direct inline editing */}
 
@@ -1363,53 +1480,63 @@ export default function PdfEditor({ fileUrl, docId }) {
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
-                        setEditBlock({item, idx});
+                        setEditBlock({item, idx, pageNumber: i+1});
                       }}
                     />
                   )}
                   {isThisEditing && (
-                    <div
-                      ref={inlineEditorRef}
-                      contentEditable
-                      suppressContentEditableWarning
-                      dir="ltr"
-                      style={{
-                        position: 'absolute',
-                        left: leftPx,
-                        top: topPx - (0.15 * heightPx),
-                        minWidth: widthPx,
-                        minHeight: heightPx,
-                        outline: '2px dashed #1976d2',
-                        // background: 'rgba(255,255,255,0.8)',
-                        background: 'transparent',
-                        fontSize: item.fontSize * scale,
-                        lineHeight: 1.1,
-                        fontWeight: item.isBold ? 700 : 400,
-                        fontStyle: item.isItalic ? 'italic' : 'normal',
-                        fontFamily: 'Helvetica, Arial, sans-serif',
-                        color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
-                        padding: '2px 4px',
-                        zIndex: 35,
-                        direction: 'ltr',
-                        textAlign: 'left',
-                        unicodeBidi: 'plaintext',
-                        whiteSpace: 'pre-wrap',
-                        writingMode: 'horizontal-tb',
-                      }}
-                      onBlur={(e)=>{
-                        const val = e.currentTarget.textContent || item.str;
-                        handleSaveTextEditInline(val);
-                      }}
-                      onKeyDown={(e)=>{
-                        if(e.key==='Enter') {
-                          e.preventDefault();
+                    <div style={{ position: 'absolute', left: leftPx, top: topPx - (0.15 * heightPx), zIndex: 35 }}>
+                      <div
+                        ref={inlineEditorRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        dir="ltr"
+                        style={{
+                          minWidth: widthPx,
+                          minHeight: heightPx,
+                          outline: '2px dashed #1976d2',
+                          background: 'transparent',
+                          fontSize: item.fontSize * scale,
+                          lineHeight: 1.1,
+                          fontWeight: item.isBold ? 700 : 400,
+                          fontStyle: item.isItalic ? 'italic' : 'normal',
+                          fontFamily: 'Helvetica, Arial, sans-serif',
+                          color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
+                          padding: '2px 4px',
+                          direction: 'ltr',
+                          textAlign: 'left',
+                          unicodeBidi: 'plaintext',
+                          whiteSpace: 'pre-wrap',
+                          writingMode: 'horizontal-tb',
+                        }}
+                        onBlur={(e)=>{
                           const val = e.currentTarget.textContent || item.str;
                           handleSaveTextEditInline(val);
-                        } else if (e.key==='Escape') {
-                          setEditBlock(null);
-                        }
-                      }}
-                    >{item.str}</div>
+                        }}
+                        onKeyDown={(e)=>{
+                          if(e.key==='Enter') {
+                            e.preventDefault();
+                            const val = e.currentTarget.textContent || item.str;
+                            handleSaveTextEditInline(val);
+                          } else if (e.key==='Escape') {
+                            setEditBlock(null);
+                          }
+                        }}
+                      >{item.str}</div>
+                      <button
+                        onClick={(ev) => { ev.stopPropagation(); handleDeleteTextInline(); }}
+                        title="Delete text"
+                        style={{
+                          marginLeft: 6,
+                          background: '#d32f2f',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: 4,
+                          padding: '2px 6px',
+                          cursor: 'pointer',
+                        }}
+                      >Delete</button>
+                    </div>
                   )}
                 </div>
               );
@@ -1608,9 +1735,31 @@ export default function PdfEditor({ fileUrl, docId }) {
                     // Embed text box into PDF when done editing
                     const finalText = textBoxRefs.current[b.id]?.textContent || "";
                     if (finalText.trim() && finalText !== "Type...") {
+                      // Embed text into PDF first, then remove box from UI
                       setTimeout(async () => {
                         await rebuildPdfWithAllContent(boxes, images);
+                        // Remove the box from UI after text is embedded
+                        setBoxes(prev => {
+                          const pageBoxes = prev[i + 1] || [];
+                          const remaining = pageBoxes.filter(bx => bx.id !== b.id);
+                          return { ...prev, [i + 1]: remaining };
+                        });
+                        socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
                       }, 200);
+                    } else {
+                      // If empty, just remove the box immediately
+                      setBoxes(prev => {
+                        const pageBoxes = prev[i + 1] || [];
+                        const remaining = pageBoxes.filter(bx => bx.id !== b.id);
+                        return { ...prev, [i + 1]: remaining };
+                      });
+                      socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      e.currentTarget.blur(); // This triggers onBlur which saves the text
                     }
                   }}
                   onMouseDown={(e) => {
