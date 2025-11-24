@@ -1,1 +1,1880 @@
-while editing the text the bold text must be bold and the normal text must be normal which is not working also bold text is not happening 
+import { useEffect, useRef, useState } from "react";
+import { Document, Page, pdfjs } from "react-pdf";
+import { io } from "socket.io-client";
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import * as pdfjsLib from 'pdfjs-dist';
+import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+// Bring in styles for text/annotation layers (silences react-pdf warnings)
+import 'react-pdf/dist/Page/AnnotationLayer.css';
+import 'react-pdf/dist/Page/TextLayer.css';
+import { loadDoc, saveDoc, uploadPdfBlob, uploadImageBlob } from "../api/docApi";
+
+const SOCKET_URL = import.meta.env.VITE_API_BASE || "https://pdf-filler-new.onrender.com";
+const DEFAULT_PAGE_SIZE = { width: 595, height: 842 };
+
+// small throttle helper so drag updates don't spam
+const throttle = (fn, ms=30) => {
+  let last = 0, timer;
+  return (...args) => {
+    const now = Date.now();
+    if (now - last >= ms) {
+      last = now; fn(...args);
+    } else {
+      clearTimeout(timer);
+      timer = setTimeout(() => { last = Date.now(); fn(...args); }, ms - (now - last));
+    }
+  };
+};
+
+export default function PdfEditor({ fileUrl, docId }) {
+  const [numPages, setNumPages] = useState(null);
+  const [scale, setScale] = useState(1.2);
+  const [autoFitEnabled, setAutoFitEnabled] = useState(true);
+  const [tool, setTool] = useState("select");
+  const [boxes, setBoxes] = useState({});
+  const wrapperRefs = useRef({});
+  const socketRef = useRef(null);
+  const [pdfBuffer, setPdfBuffer] = useState(null); // Uint8Array for pdf-lib
+  const [editedUrl, setEditedUrl] = useState(null); // Updated PDF fileUrl
+  const [showTextEdit, setShowTextEdit] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [pdfTextItems, setPdfTextItems] = useState({}); // PDF text with positions by page
+  const [editBlock, setEditBlock] = useState(null); // {item, idx}
+  const [boldToggle, setBoldToggle] = useState(false);
+  const inlineEditorRef = useRef(null);
+  const [pageSizes, setPageSizes] = useState({ 1: DEFAULT_PAGE_SIZE });
+  const [docVersion, setDocVersion] = useState(0);
+  const [fontSizeInput, setFontSizeInput] = useState(12);
+  const [fontColorHex, setFontColorHex] = useState('#000000');
+  const [history, setHistory] = useState([]); // Array<{bytes: Uint8Array, url: string|null}>
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [images, setImages] = useState({}); // {pageNumber: [{id, left, top, width, height, imageUrl, imageBytes}]}
+  const [selectedImageFile, setSelectedImageFile] = useState(null);
+  const imageInputRef = useRef(null);
+  const textBoxRefs = useRef({});
+  const caretPositionsRef = useRef({});
+  const [activeBoxId, setActiveBoxId] = useState(null);
+  const activeBoxIdRef = useRef(null);
+
+  // Ensure we always have valid PDF bytes for pdf-lib
+  async function ensurePdfBytes() {
+    if (pdfBuffer && pdfBuffer.length > 6) {
+      const hdr = String.fromCharCode(pdfBuffer[0], pdfBuffer[1], pdfBuffer[2], pdfBuffer[3]);
+      if (hdr === '%PDF') return pdfBuffer;
+    }
+    const src = editedUrl || fileUrl;
+    if (!src) throw new Error('No PDF source available');
+    const ab = await fetch(src).then(r => r.arrayBuffer());
+    const bytes = new Uint8Array(ab);
+    setPdfBuffer(bytes);
+    return bytes;
+  }
+
+  // connect socket & join doc room
+  useEffect(() => {
+    if (!docId) return;
+    const socket = io(SOCKET_URL, { transports: ["websocket"] });
+    socketRef.current = socket;
+
+    socket.emit("join", { docId });
+
+    socket.on("init_state", ({ boxes, images }) => {
+      setBoxes(boxes || {});
+      setImages(images || {});
+    });
+    socket.on("box_added", ({ pageNumber, box }) => {
+      setBoxes(prev => ({ ...prev, [pageNumber]: [...(prev[pageNumber]||[]), box] }));
+    });
+    socket.on("box_updated", ({ pageNumber, boxId, patch }) => {
+      setBoxes(prev => {
+        const arr = prev[pageNumber] || [];
+        const i = arr.findIndex(b => b.id === boxId);
+        if (i < 0) return prev;
+        const clone = [...arr]; clone[i] = { ...clone[i], ...patch };
+        return { ...prev, [pageNumber]: clone };
+      });
+    });
+    socket.on("box_deleted", ({ pageNumber, boxId }) => {
+      setBoxes(prev => ({ ...prev, [pageNumber]: (prev[pageNumber]||[]).filter(b => b.id !== boxId) }));
+    });
+
+    // optional lock visuals
+    socket.on("box_locked", ({ boxId }) => {
+      setBoxes(prev => {
+        const copy = {};
+        for (const [page, arr] of Object.entries(prev)) {
+          copy[page] = arr.map(b => b.id===boxId ? { ...b, locked:true } : b);
+        }
+        return copy;
+      });
+    });
+    socket.on("box_unlocked", ({ boxId }) => {
+      setBoxes(prev => {
+        const copy = {};
+        for (const [page, arr] of Object.entries(prev)) {
+          copy[page] = arr.map(b => b.id===boxId ? { ...b, locked:false } : b);
+        }
+        return copy;
+      });
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [docId]);
+
+  // Load persisted boxes/pdf once when docId changes (in addition to socket init)
+  useEffect(() => {
+    if (!docId) return;
+    let cancelled = false;
+    loadDoc(docId).then((state) => {
+      if (cancelled || !state) return;
+      if (state.boxes) setBoxes(state.boxes);
+      if (state.images) setImages(state.images);
+      if (state.pdfUrl) setEditedUrl(`${SOCKET_URL}${state.pdfUrl}`);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [docId]);
+
+  // Persist boxes and images when window unloads or doc changes
+  useEffect(() => {
+    if (!docId) return;
+    const handler = () => { try { saveDoc(docId, { boxes, images }); } catch {}
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [docId, boxes, images]);
+
+  useEffect(() => {
+    setBoxes({});
+    setImages({});
+    setNumPages(null);
+    setEditedUrl(null); // Reset edited file
+    setPdfTextItems({}); // Reset when file changes
+    setPageSizes({ 1: DEFAULT_PAGE_SIZE });
+    setEditBlock(null);
+    setAutoFitEnabled(true);
+    // Fetch as ArrayBuffer and normalize to Uint8Array for pdf-lib usage
+    if (fileUrl) {
+      fetch(fileUrl).then(res => res.arrayBuffer()).then(buf => {
+        const bytes = new Uint8Array(buf);
+        setPdfBuffer(bytes);
+        // Clone bytes for history to avoid detached ArrayBuffer issues
+        setHistory([{ bytes: new Uint8Array(bytes), url: fileUrl || null }]);
+        setHistoryIndex(0);
+        extractTextItems(bytes, 'all');
+      });
+    }
+  }, [fileUrl]);
+
+  // Auto-fit scale to wrapper width when a new document loads or page sizes change
+  useEffect(() => {
+    if (!autoFitEnabled) return;
+    if (!numPages) return;
+    // Prefer page 1 as representative
+    const wrap = wrapperRefs.current[1];
+    const metrics = pageSizes[1] || DEFAULT_PAGE_SIZE;
+    if (!wrap || !metrics || !metrics.width) return;
+    try {
+      const availableWidth = wrap.clientWidth || wrap.offsetWidth || window.innerWidth;
+      if (availableWidth <= 0) return;
+      const targetScale = availableWidth / metrics.width;
+      // Clamp to sensible bounds
+      const clamped = Math.min(2.0, Math.max(0.5, targetScale));
+      setScale(clamped);
+    } catch (err) {
+      // ignore
+    }
+  }, [numPages, pageSizes, autoFitEnabled, editedUrl, fileUrl]);
+
+  // If we load an already-edited PDF from backend (editedUrl), fetch bytes so pdf-lib can edit
+  useEffect(() => {
+    if (!editedUrl) return;
+    if (editedUrl.startsWith('blob:')) return; // already have bytes for blob URL
+    fetch(editedUrl).then(res => res.arrayBuffer()).then(buf => {
+      const bytes = new Uint8Array(buf);
+      setPdfBuffer(bytes);
+      extractTextItems(bytes, 'all');
+    }).catch(() => {});
+  }, [editedUrl]);
+
+  // Function to extract text items (pageNum=1) with color information
+  async function extractTextItems(pdfArrayBuffer, pageNum=1) {
+    // Use the same worker version already set from pdfjs-dist import above
+    const pdf = await pdfjsLib.getDocument({ data: pdfArrayBuffer }).promise;
+    const targets = pageNum === 'all'
+      ? Array.from({ length: pdf.numPages }, (_, idx) => idx + 1)
+      : Array.isArray(pageNum) ? pageNum : [pageNum];
+
+    const itemsByPage = {};
+    const sizesByPage = {};
+
+    // Normalize color values to 0-1 range for consistent storage
+    const normalizeColorValue = (val) => {
+      const num = typeof val === 'number' ? val : parseFloat(val);
+      if (isNaN(num)) return 0;
+      return Math.max(0, Math.min(1, num));
+    };
+
+    for (const targetPage of targets) {
+      const page = await pdf.getPage(targetPage);
+      const viewport = page.getViewport({ scale: 1 });
+      sizesByPage[targetPage] = { width: viewport.width, height: viewport.height };
+      const textContent = await page.getTextContent();
+      const ops = await page.getOperatorList();
+      let currentColor = { r: 0, g: 0, b: 0 };
+
+      for (let i = 0; i < ops.fnArray.length; i++) {
+        const op = ops.fnArray[i];
+        if (op === pdfjsLib.OPS.setFillRGBColor && ops.argsArray[i] && ops.argsArray[i].length >= 3) {
+          currentColor = {
+            r: normalizeColorValue(ops.argsArray[i][0]),
+            g: normalizeColorValue(ops.argsArray[i][1]),
+            b: normalizeColorValue(ops.argsArray[i][2])
+          };
+        } else if (op === pdfjsLib.OPS.setFillGrayColor && ops.argsArray[i] && ops.argsArray[i].length >= 1) {
+          const gray = normalizeColorValue(ops.argsArray[i][0]);
+          currentColor = { r: gray, g: gray, b: gray };
+        } else if (op === pdfjsLib.OPS.setFillColorSpace && ops.argsArray[i]) {
+          currentColor = { r: 0, g: 0, b: 0 };
+        }
+      }
+
+      const items = textContent.items.map((item) => {
+        const [, , , d, e, f] = item.transform;
+        const fontName = item.fontName || 'Helvetica';
+        const isBold = /Bold|Semibold|Medium/gi.test(fontName);
+        const isItalic = /Italic|Oblique/gi.test(fontName);
+
+        return {
+          str: item.str,
+          x: e,
+          y: f,
+          fontSize: Math.abs(d),
+          width: item.width,
+          height: item.height,
+          fontName,
+          isBold,
+          isItalic,
+          color: currentColor,
+        };
+      });
+
+      itemsByPage[targetPage] = items;
+    }
+
+    if (Object.keys(sizesByPage).length) {
+      setPageSizes(prev => ({ ...prev, ...sizesByPage }));
+    }
+    if (Object.keys(itemsByPage).length) {
+      setPdfTextItems(prev => ({ ...prev, ...itemsByPage }));
+    }
+  }
+
+  // Sample the rendered page to get the background color under a text item.
+  // Returns {r,g,b} in 0..1 range or null on failure.
+  async function sampleBackgroundColorForItem(pageNumber, item) {
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+      if (pageNumber < 1 || pageNumber > pdf.numPages) return null;
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      // PDF item.x is in PDF units from left; item.y is baseline distance from bottom.
+      const x = Math.round(item.x);
+      const y = Math.round(viewport.height - item.y);
+      const px = Math.min(Math.max(0, x), canvas.width - 1);
+      const py = Math.min(Math.max(0, y), canvas.height - 1);
+      const data = ctx.getImageData(px, py, 1, 1).data; // [r,g,b,a]
+      if (!data || data.length < 3) return null;
+      return { r: data[0] / 255, g: data[1] / 255, b: data[2] / 255 };
+    } catch (err) {
+      return null;
+    }
+  }
+  
+  // Helper to convert RGB color to hex
+  function rgbToHex(r, g, b) {
+    const toHex = (n) => {
+      const hex = Math.round(Math.max(0, Math.min(255, n * 255))).toString(16);
+      return hex.length === 1 ? '0' + hex : hex;
+    };
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+  }
+
+  // Escape text for safe innerHTML insertion
+  function escapeHtml(unsafe) {
+    return String(unsafe)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function onDocLoadSuccess({ numPages }) {
+    setNumPages(numPages);
+  }
+
+  // --- Demo add text at fixed loc ---
+  async function handleAddPdfText() {
+    const bytes = await ensurePdfBytes();
+    const pdfDoc = await PDFDocument.load(bytes);
+    const page = pdfDoc.getPages()[0];
+    const size = Number(fontSizeInput) || 12;
+    const { r, g, b } = hexToRgb01(fontColorHex);
+    page.drawText(editText || 'Edited Text!', {
+      x: 50, y: 600,
+      size,
+      color: rgb(r, g, b),
+    });
+    const newBytes = await pdfDoc.save(); // Uint8Array
+    const blob = new Blob([newBytes], { type: 'application/pdf' });
+    try {
+      const { url } = await uploadPdfBlob(blob);
+      const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+      setEditedUrl(absolute);
+      setPdfBuffer(newBytes);
+      pushHistory(newBytes, absolute);
+      if (docId) await saveDoc(docId, { boxes, pdfUrl: url });
+      setDocVersion(v => v + 1);
+    } catch {
+      const url = URL.createObjectURL(blob);
+      setEditedUrl(url);
+      setPdfBuffer(newBytes);
+      pushHistory(newBytes, url);
+      setDocVersion(v => v + 1);
+    }
+    setShowTextEdit(false);
+    setEditText("");
+    await extractTextItems(newBytes, 'all');
+  }
+
+  // Inline save of edited block (cover old, write new) with original font, size, and color
+  async function handleSaveTextEditInline(newStr) {
+    if (!editBlock) return;
+    const bytes = await ensurePdfBytes();
+    const pdfDoc = await PDFDocument.load(bytes);
+    const pageIndex = ((editBlock && editBlock.pageNumber) ? editBlock.pageNumber : 1) - 1;
+    const page = pdfDoc.getPages()[pageIndex];
+
+    // Use original font properties - don't override with user inputs
+    const item = editBlock.item;
+    const fontSizeToUse = item.fontSize || 12;
+
+    // Use original color if available, otherwise default to black
+    const originalColor = item.color || { r: 0, g: 0, b: 0 };
+    const normalizeColor = (val) => {
+      if (typeof val !== 'number') {
+        const num = parseFloat(val);
+        if (isNaN(num)) return 0;
+        return num > 1 ? num / 255 : num;
+      }
+      return val > 1 ? val / 255 : val;
+    };
+    const r = Math.max(0, Math.min(1, normalizeColor(originalColor.r)));
+    const g = Math.max(0, Math.min(1, normalizeColor(originalColor.g)));
+    const b = Math.max(0, Math.min(1, normalizeColor(originalColor.b)));
+    const textColor = rgb(r, g, b);
+
+    // Get HTML from the inline editor (prefer rich HTML to preserve bold runs)
+    const editorHtml = inlineEditorRef.current?.innerHTML || newStr || item.str;
+
+    // Parse HTML into runs with bold/italic flags
+    const parseRunsFromHtml = (html) => {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = html;
+      const runs = [];
+      const walk = (node, bold = false, italic = false) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const txt = node.nodeValue.replace(/\u00A0/g, ' ');
+          if (txt.length > 0) runs.push({ text: txt, bold, italic });
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        let nb = bold;
+        let ni = italic;
+        const tag = node.tagName && node.tagName.toLowerCase();
+        if (tag === 'b' || tag === 'strong') nb = true;
+        if (tag === 'i' || tag === 'em') ni = true;
+        const fw = node.style && node.style.fontWeight;
+        if (fw) {
+          const num = parseInt(fw, 10);
+          if (!isNaN(num)) nb = num >= 600;
+          else if (fw === 'bold' || fw === '700') nb = true;
+        }
+        const fs = node.style && node.style.fontStyle;
+        if (fs === 'italic' || fs === 'oblique') ni = true;
+        // Recurse children
+        for (const child of Array.from(node.childNodes)) walk(child, nb, ni);
+      };
+      for (const child of Array.from(wrapper.childNodes)) walk(child, false, false);
+      return runs;
+    };
+
+    const runs = parseRunsFromHtml(editorHtml);
+
+    // Calculate cover rect dimensions using a regular font to measure
+    const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const oldTextWidth = regularFont.widthOfTextAtSize(item.str, fontSizeToUse);
+    // sum new widths
+    const newTextWidth = runs.reduce((s, r) => {
+      const f = r.bold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica;
+      // Use embedded font for measurement
+      try {
+        const embedded = pdfDoc.embedFont ? pdfDoc.embedFont(f) : null; // placeholder
+      } catch {}
+      // fallback to regular measurement
+      return s + regularFont.widthOfTextAtSize(r.text, fontSizeToUse);
+    }, 0);
+    const textWidth = Math.max(oldTextWidth, newTextWidth) + 2;
+
+    const actualHeight = item.height || (fontSizeToUse * 0.7);
+    const baselineY = item.y;
+    const coverY = baselineY - (actualHeight * 0.2);
+    const coverHeight = actualHeight * 1.1;
+
+    // Sample background color and use that to cover the old text
+    let coverColor = { r: 1, g: 1, b: 1 };
+    try {
+      const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, item);
+      if (sampled) coverColor = sampled;
+    } catch {}
+
+    page.drawRectangle({ x: item.x - 1, y: coverY, width: textWidth, height: coverHeight, color: rgb(coverColor.r, coverColor.g, coverColor.b), opacity: 1.0 });
+
+    // Embed fonts we'll need
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    let fontItalic, fontBoldItalic;
+    try { fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique); } catch { fontItalic = fontRegular; }
+    try { fontBoldItalic = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique); } catch { fontBoldItalic = fontBold; }
+
+    // Draw each run sequentially, advancing X by measured widths
+    let curX = item.x;
+    for (const run of runs) {
+      const useFont = run.bold && run.italic ? fontBoldItalic : run.bold ? fontBold : run.italic ? fontItalic : fontRegular;
+      const w = useFont.widthOfTextAtSize(run.text, fontSizeToUse);
+      page.drawText(run.text, { x: curX, y: item.y, size: fontSizeToUse, font: useFont, color: textColor });
+      curX += w;
+    }
+
+    const newBytes = await pdfDoc.save(); // Uint8Array
+    const blob = new Blob([newBytes], { type: 'application/pdf' });
+    try {
+      const { url } = await uploadPdfBlob(blob);
+      const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+      setEditedUrl(absolute);
+      setPdfBuffer(newBytes);
+      pushHistory(newBytes, absolute);
+      if (docId) await saveDoc(docId, { boxes, pdfUrl: url });
+      setDocVersion(v => v + 1);
+    } catch {
+      const url = URL.createObjectURL(blob);
+      setEditedUrl(url);
+      setPdfBuffer(newBytes);
+      pushHistory(newBytes, url);
+      setDocVersion(v => v + 1);
+    }
+    setEditBlock(null);
+    // Re-extract to refresh clickable zones
+    await extractTextItems(newBytes, 'all');
+  }
+
+  // Delete inline PDF text by covering the original text area with white
+  // and saving the PDF. Mirrors the covering logic used when saving edits.
+  async function handleDeleteTextInline() {
+    if (!editBlock) return;
+    const item = editBlock.item;
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdfDoc = await PDFDocument.load(bytes);
+      const pageIndex = ((editBlock && editBlock.pageNumber) ? editBlock.pageNumber : 1) - 1;
+      const page = pdfDoc.getPages()[pageIndex];
+
+      // Determine original font size and metrics
+      const originalFontSize = item.fontSize || 12;
+      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+      const oldTextWidth = font.widthOfTextAtSize(item.str, originalFontSize);
+      const textWidth = oldTextWidth + 2;
+      const actualHeight = item.height || (originalFontSize * 0.7);
+      const baselineY = item.y;
+      const coverY = baselineY - (actualHeight * 0.2);
+      const coverHeight = actualHeight * 1.1;
+
+      // Sample background color and use that to cover the old text
+      let coverColor = { r: 1, g: 1, b: 1 };
+      try {
+        const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, item);
+        if (sampled) coverColor = sampled;
+      } catch {}
+
+      page.drawRectangle({
+        x: item.x - 1,
+        y: coverY,
+        width: textWidth,
+        height: coverHeight,
+        color: rgb(coverColor.r, coverColor.g, coverColor.b),
+        opacity: 1.0,
+      });
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes, pdfUrl: url });
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      setEditBlock(null);
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to delete inline text:', err);
+    }
+  }
+
+  // Convert #RRGGBB to 0..1 rgb for pdf-lib
+  function hexToRgb01(hex) {
+    const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || '#000000');
+    if (!m) return { r: 0, g: 0, b: 0 };
+    return { r: parseInt(m[1],16)/255, g: parseInt(m[2],16)/255, b: parseInt(m[3],16)/255 };
+  }
+
+  function pushHistory(bytes, url) {
+    // Clone bytes to avoid detached ArrayBuffer issues
+    const clonedBytes = new Uint8Array(bytes);
+    setHistory(prev => {
+      const trimmed = prev.slice(0, historyIndex + 1);
+      const next = [...trimmed, { bytes: clonedBytes, url }];
+      setHistoryIndex(next.length - 1);
+      return next;
+    });
+  }
+
+  const canUndo = historyIndex > 0;
+  const canRedo = historyIndex >= 0 && historyIndex < history.length - 1;
+
+  function handleUndo() {
+    if (!canUndo) return;
+    const idx = historyIndex - 1;
+    const entry = history[idx];
+    setHistoryIndex(idx);
+    // Clone bytes to avoid detached ArrayBuffer issues
+    const clonedBytes = new Uint8Array(entry.bytes);
+    setPdfBuffer(clonedBytes);
+    const url = URL.createObjectURL(new Blob([clonedBytes], { type: 'application/pdf' }));
+    setEditedUrl(url);
+    setDocVersion(v => v + 1);
+    extractTextItems(clonedBytes, 'all');
+  }
+
+  function handleRedo() {
+    if (!canRedo) return;
+    const idx = historyIndex + 1;
+    const entry = history[idx];
+    setHistoryIndex(idx);
+    // Clone bytes to avoid detached ArrayBuffer issues
+    const clonedBytes = new Uint8Array(entry.bytes);
+    setPdfBuffer(clonedBytes);
+    const url = URL.createObjectURL(new Blob([clonedBytes], { type: 'application/pdf' }));
+    setEditedUrl(url);
+    setDocVersion(v => v + 1);
+    extractTextItems(clonedBytes, 'all');
+  }
+
+  const getPageMetrics = (pageNumber) => {
+    if (pageSizes[pageNumber]) return pageSizes[pageNumber];
+    if (pageSizes[1]) return pageSizes[1];
+    return DEFAULT_PAGE_SIZE;
+  };
+
+  const getBoxDimensions = (fontSize) => {
+    const resolved = Math.max(6, fontSize || Number(fontSizeInput) || 12);
+    return {
+      width: Math.max(180, resolved * 10),
+      height: resolved + 8,
+    };
+  };
+
+  const placeCaret = (el, offset=null) => {
+    if (!el) return;
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    let targetNode = el.firstChild;
+    if (!targetNode) {
+      targetNode = document.createTextNode('');
+      el.appendChild(targetNode);
+    }
+    const textLength = targetNode.textContent?.length || 0;
+    const caretOffset = offset === null ? textLength : Math.min(Math.max(0, offset), textLength);
+    try {
+      range.setStart(targetNode, caretOffset);
+    } catch {
+      range.setStart(targetNode, textLength);
+    }
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  const rememberCaret = (boxId, offset) => {
+    caretPositionsRef.current[boxId] = offset;
+  };
+
+  const restoreCaret = (boxId, fallbackToEnd=true) => {
+    const el = textBoxRefs.current[boxId];
+    if (!el) return;
+    const stored = caretPositionsRef.current[boxId];
+    if (stored == null && !fallbackToEnd) return;
+    const offset = stored == null ? null : stored;
+    placeCaret(el, offset);
+  };
+
+  const focusNewTextBox = (boxId) => {
+    setTimeout(() => {
+      const textBoxEl = textBoxRefs.current[boxId];
+      if (textBoxEl) {
+        textBoxEl.setAttribute('dir', 'ltr');
+        textBoxEl.style.direction = 'ltr';
+        textBoxEl.style.textAlign = 'left';
+        textBoxEl.style.unicodeBidi = 'plaintext';
+        textBoxEl.style.writingMode = 'horizontal-tb';
+        if (textBoxEl.textContent === "Type..." || !textBoxEl.textContent?.trim()) {
+          textBoxEl.textContent = "";
+          setBoxes(prev => {
+            const copy = { ...prev };
+            for (const page of Object.keys(copy)) {
+              copy[page] = copy[page].map(b => b.id === boxId ? { ...b, text: "" } : b);
+            }
+            return copy;
+          });
+        }
+        textBoxEl.focus();
+        placeCaret(textBoxEl, null);
+        rememberCaret(boxId, null);
+      }
+    }, 50);
+  };
+
+  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text }) => {
+    const resolvedFontSize = Math.max(6, fontSize || Number(fontSizeInput) || 12);
+    const dims = getBoxDimensions(resolvedFontSize);
+    const boxWidth = width || dims.width;
+    const boxHeight = height || dims.height;
+    const wrap = wrapperRefs.current[pageNumber];
+    const maxWidth = wrap?.clientWidth || boxWidth;
+    const maxHeight = wrap?.clientHeight || boxHeight;
+    const normalizedLeft = Math.min(Math.max(0, left - boxWidth / 2), Math.max(0, maxWidth - boxWidth));
+    const normalizedTop = Math.min(Math.max(0, top - (boxHeight * 0.75)), Math.max(0, maxHeight - boxHeight));
+    const box = {
+      id: crypto.randomUUID(),
+      left: normalizedLeft,
+      top: normalizedTop,
+      width: boxWidth,
+      height: boxHeight,
+      text: text ?? "Type...",
+      fontSize: resolvedFontSize,
+      color: color || fontColorHex,
+      isBold: typeof isBold === "boolean" ? isBold : boldToggle,
+    };
+    setBoxes(prev => ({ ...prev, [pageNumber]: [...(prev[pageNumber] || []), box] }));
+    socketRef.current?.emit("add_box", { docId, pageNumber, box });
+    focusNewTextBox(box.id);
+    return box;
+  };
+
+  const isPointInExistingContent = (pageNumber, left, top) => {
+    const pageBoxes = boxes[pageNumber] || [];
+    const hitBox = pageBoxes.some(b => (
+      left >= b.left && left <= b.left + b.width &&
+      top >= b.top && top <= b.top + b.height
+    ));
+    if (hitBox) return true;
+
+    const items = pdfTextItems[pageNumber] || [];
+    if (!items.length) return false;
+    const metrics = getPageMetrics(pageNumber);
+    return items.some(item => {
+      const txtLeft = item.x * scale;
+      const txtTop = (metrics.height - item.y) * scale;
+      const txtWidth = (item.width || (item.fontSize || 12)) * scale;
+      const txtHeight = (item.height || item.fontSize || 12) * scale;
+      return (
+        left >= txtLeft && left <= txtLeft + txtWidth &&
+        top >= txtTop && top <= txtTop + txtHeight
+      );
+    });
+  };
+
+  const inferFontStyleFromNearbyText = (pageNumber, left, top) => {
+    const items = pdfTextItems[pageNumber] || pdfTextItems[1] || [];
+    if (!items.length) {
+      return {
+        fontSize: Number(fontSizeInput) || 12,
+        color: fontColorHex,
+        isBold: boldToggle,
+      };
+    }
+    const metrics = getPageMetrics(pageNumber);
+    let closest = null;
+    let minDistance = Infinity;
+    items.forEach(item => {
+      const txtLeft = item.x * scale;
+      const txtTop = (metrics.height - item.y) * scale;
+      const txtWidth = (item.width || (item.fontSize || 12)) * scale;
+      const txtHeight = (item.height || item.fontSize || 12) * scale;
+      const centerX = txtLeft + txtWidth / 2;
+      const centerY = txtTop + txtHeight / 2;
+      const distance = Math.hypot(centerX - left, centerY - top);
+      if (distance < minDistance) {
+        minDistance = distance;
+        closest = item;
+      }
+    });
+    if (!closest) {
+      return {
+        fontSize: Number(fontSizeInput) || 12,
+        color: fontColorHex,
+        isBold: boldToggle,
+      };
+    }
+    return {
+      fontSize: closest.fontSize || Number(fontSizeInput) || 12,
+      color: closest.color ? rgbToHex(closest.color.r, closest.color.g, closest.color.b) : fontColorHex,
+      isBold: !!closest.isBold,
+    };
+  };
+
+  const handleQuickAddTextBox = (pageNumber, e) => {
+    if (tool !== "select") return;
+    const wrap = wrapperRefs.current[pageNumber];
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const left = e.clientX - rect.left;
+    const top = e.clientY - rect.top;
+    if (isPointInExistingContent(pageNumber, left, top)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const style = inferFontStyleFromNearbyText(pageNumber, left, top);
+    createTextBox({
+      pageNumber,
+      left,
+      top,
+      fontSize: style.fontSize,
+      color: style.color,
+      isBold: style.isBold,
+    });
+  };
+
+  const addTextBox = (pageNumber, e, containerEl=null) => {
+    if (tool !== "text") return;
+    e.stopPropagation();
+    const wrap = containerEl || wrapperRefs.current[pageNumber];
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const left = e.clientX - rect.left;
+    const top  = e.clientY - rect.top;
+
+    createTextBox({
+      pageNumber,
+      left,
+      top,
+      fontSize: Number(fontSizeInput) || 12,
+      color: fontColorHex,
+      isBold: boldToggle,
+    });
+  };
+
+  const updateBox = throttle((pageNumber, boxId, patch) => {
+    setBoxes(prev => {
+      const arr = prev[pageNumber] || [];
+      const i = arr.findIndex(b => b.id === boxId);
+      if (i < 0) return prev;
+      const clone = [...arr]; clone[i] = { ...clone[i], ...patch };
+      return { ...prev, [pageNumber]: clone };
+    });
+    socketRef.current?.emit("update_box", { docId, pageNumber, boxId, patch });
+  }, 30);
+
+  // Rebuild PDF with all text boxes and images
+  async function rebuildPdfWithAllContent(boxesToUse = null, imagesToUse = null) {
+    try {
+      const boxesToEmbed = boxesToUse || boxes;
+      const imagesToEmbed = imagesToUse || images;
+      // Prefer the most-recent in-memory/edited PDF so previously-embedded
+      // text/images are preserved. Fall back to `editedUrl`, then the
+      // original `fileUrl` if needed.
+      if (pdfBuffer && pdfBuffer.length > 6) {
+        const pdfDoc = await PDFDocument.load(pdfBuffer);
+        await embedAllContent(pdfDoc, boxesToEmbed, imagesToEmbed);
+        return;
+      }
+
+      const src = editedUrl || fileUrl;
+      if (!src) return;
+      const ab = await fetch(src).then(r => r.arrayBuffer());
+      const bytes = new Uint8Array(ab);
+      const pdfDoc = await PDFDocument.load(bytes);
+      await embedAllContent(pdfDoc, boxesToEmbed, imagesToEmbed);
+    } catch (err) {
+      console.error('Failed to rebuild PDF with all content:', err);
+    }
+  }
+  
+  // Helper function to embed all content (text boxes and images) into PDF
+  async function embedAllContent(pdfDoc, boxesToEmbed, imagesToEmbed) {
+    try {
+      // Embed text boxes first
+      const allPages = Object.keys(boxesToEmbed);
+      for (const pageNum of allPages) {
+        const pageIndex = parseInt(pageNum) - 1;
+        if (pageIndex >= 0 && pageIndex < pdfDoc.getPageCount()) {
+          const page = pdfDoc.getPages()[pageIndex];
+          const pageHeight = page.getHeight();
+          const pageBoxes = boxesToEmbed[pageNum] || [];
+          
+          for (const box of pageBoxes) {
+            if (!box.text || box.text.trim() === "" || box.text === "Type...") continue;
+            
+            // Use box-specific font settings or fallback to global settings
+            const boxFontSize = box.fontSize || Number(fontSizeInput) || 12;
+            const boxColor = box.color || fontColorHex;
+            const boxIsBold = box.isBold !== undefined ? box.isBold : boldToggle;
+            
+            const { r, g, b } = hexToRgb01(boxColor);
+            const textColor = rgb(r, g, b);
+            const font = await pdfDoc.embedFont(boxIsBold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica);
+            
+            // Convert screen coordinates to PDF coordinates
+            const pdfX = box.left / scale;
+            const pdfY = pageHeight - (box.top / scale) - (box.height / scale);
+            
+            // Draw text in PDF
+            page.drawText(box.text, {
+              x: pdfX,
+              y: pdfY + boxFontSize, // Adjust for baseline
+              size: boxFontSize,
+              font,
+              color: textColor,
+            });
+          }
+        }
+      }
+      
+      // Embed images
+      const allImagePages = Object.keys(imagesToEmbed);
+      for (const pageNum of allImagePages) {
+        const pageIndex = parseInt(pageNum) - 1;
+        if (pageIndex >= 0 && pageIndex < pdfDoc.getPageCount()) {
+          const page = pdfDoc.getPages()[pageIndex];
+          const pageHeight = page.getHeight();
+          const imagesOnPage = imagesToEmbed[pageNum] || [];
+          
+          for (const img of imagesOnPage) {
+            const pdfX = img.left / scale;
+            const pdfY = pageHeight - (img.top / scale) - (img.height / scale);
+            const pdfWidth = img.width / scale;
+            const pdfHeight = img.height / scale;
+
+            let pdfImage;
+            try {
+              if (img.imageType === 'image/png') {
+                pdfImage = await pdfDoc.embedPng(img.imageBytes);
+              } else if (img.imageType === 'image/jpeg' || img.imageType === 'image/jpg') {
+                pdfImage = await pdfDoc.embedJpg(img.imageBytes);
+              } else {
+                pdfImage = await pdfDoc.embedPng(img.imageBytes);
+              }
+            } catch {
+              pdfImage = await pdfDoc.embedPng(img.imageBytes);
+            }
+
+            page.drawImage(pdfImage, {
+              x: Math.max(0, pdfX),
+              y: Math.max(0, pdfY),
+              width: pdfWidth,
+              height: pdfHeight,
+            });
+          }
+        }
+      }
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes: boxesToEmbed, images: imagesToEmbed, pdfUrl: url });
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to embed all content:', err);
+    }
+  }
+
+  const deleteBox = async (pageNumber, boxId) => {
+    // Remove from state and get updated boxes
+    let updatedBoxes;
+    setBoxes(prev => {
+      const remaining = (prev[pageNumber] || []).filter(b => b.id !== boxId);
+      updatedBoxes = { ...prev, [pageNumber]: remaining };
+      return updatedBoxes;
+    });
+    
+    socketRef.current?.emit("delete_box", { docId, pageNumber, boxId });
+    
+    // Rebuild PDF with remaining boxes and images
+    await rebuildPdfWithAllContent(updatedBoxes, images);
+  };
+
+  const lock = (boxId) => socketRef.current?.emit("lock_box", { docId, boxId });
+  const unlock = (boxId) => socketRef.current?.emit("unlock_box", { docId, boxId });
+
+  // Image handling functions - simplified
+  function handleImageFileSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) {
+      setTool("select");
+      return;
+    }
+    if (!file.type.startsWith('image/')) {
+      alert('Please select an image file (PNG, JPG, etc.)');
+      setTool("select");
+      return;
+    }
+    setSelectedImageFile(file);
+    setTool("image");
+    // User will now click on PDF to place it
+  }
+
+  async function addImage(pageNumber, e) {
+    if (tool !== "image" || !selectedImageFile) {
+      return;
+    }
+    
+    e.stopPropagation();
+    const wrap = wrapperRefs.current[pageNumber];
+    if (!wrap) return;
+    
+    const rect = wrap.getBoundingClientRect();
+    const left = e.clientX - rect.left;
+    const top = e.clientY - rect.top;
+
+    try {
+      // Create image preview URL
+      const imageUrl = URL.createObjectURL(selectedImageFile);
+      
+      // Read image as bytes for embedding
+      const imageBytes = await selectedImageFile.arrayBuffer();
+
+      // Get actual image dimensions
+      const img = new Image();
+      img.src = imageUrl;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        setTimeout(reject, 5000); // 5 second timeout
+      });
+
+      // Calculate size to fit nicely (default 150px max on screen)
+      const maxScreenSize = 150;
+      let screenWidth = img.width;
+      let screenHeight = img.height;
+      if (screenWidth > maxScreenSize || screenHeight > maxScreenSize) {
+        const ratio = Math.min(maxScreenSize / screenWidth, maxScreenSize / screenHeight);
+        screenWidth = screenWidth * ratio;
+        screenHeight = screenHeight * ratio;
+      }
+
+      const imageObj = {
+        id: crypto.randomUUID(),
+        left,
+        top,
+        width: screenWidth,
+        height: screenHeight,
+        imageUrl,
+        imageBytes: new Uint8Array(imageBytes),
+        imageType: selectedImageFile.type,
+      };
+
+      // Add to state
+      const updatedImages = { ...images, [pageNumber]: [...(images[pageNumber]||[]), imageObj] };
+      setImages(updatedImages);
+      socketRef.current?.emit("add_image", { docId, pageNumber, image: imageObj });
+      
+      // Embed image in PDF (preserves all text boxes)
+      await rebuildPdfWithAllContent(boxes, updatedImages);
+      
+      // Reset tool and selected file
+      setSelectedImageFile(null);
+      if (imageInputRef.current) imageInputRef.current.value = '';
+      setTool("select");
+    } catch (err) {
+      console.error('Failed to add image:', err);
+      alert('Failed to load image. Please try again.');
+      setSelectedImageFile(null);
+      setTool("select");
+    }
+  }
+
+  async function embedImageInPdf(pageNumber, imageObj) {
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdfDoc = await PDFDocument.load(bytes);
+      const page = pdfDoc.getPages()[pageNumber - 1];
+      const pageHeight = page.getHeight();
+      
+      // Convert screen coordinates to PDF coordinates
+      // Screen: top-left origin, PDF: bottom-left origin
+      const pdfX = imageObj.left / scale;
+      const pdfY = pageHeight - (imageObj.top / scale) - (imageObj.height / scale);
+      const pdfWidth = imageObj.width / scale;
+      const pdfHeight = imageObj.height / scale;
+
+      // Embed image based on type
+      let pdfImage;
+      try {
+        if (imageObj.imageType === 'image/png') {
+          pdfImage = await pdfDoc.embedPng(imageObj.imageBytes);
+        } else if (imageObj.imageType === 'image/jpeg' || imageObj.imageType === 'image/jpg') {
+          pdfImage = await pdfDoc.embedJpg(imageObj.imageBytes);
+        } else {
+          // Default to PNG for other formats
+          pdfImage = await pdfDoc.embedPng(imageObj.imageBytes);
+        }
+      } catch (embedErr) {
+        console.error('Image embed error:', embedErr);
+        // Try PNG as fallback
+        pdfImage = await pdfDoc.embedPng(imageObj.imageBytes);
+      }
+
+      // Draw image on PDF
+      page.drawImage(pdfImage, {
+        x: Math.max(0, pdfX),
+        y: Math.max(0, pdfY),
+        width: pdfWidth,
+        height: pdfHeight,
+      });
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) {
+          const currentImages = { ...images, [pageNumber]: [...(images[pageNumber]||[]), imageObj] };
+          await saveDoc(docId, { boxes, images: currentImages, pdfUrl: url });
+        }
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to embed image:', err);
+      alert('Failed to embed image in PDF: ' + err.message);
+    }
+  }
+
+  const updateImage = throttle((pageNumber, imageId, patch) => {
+    setImages(prev => {
+      const arr = prev[pageNumber] || [];
+      const i = arr.findIndex(img => img.id === imageId);
+      if (i < 0) return prev;
+      const clone = [...arr]; clone[i] = { ...clone[i], ...patch };
+      return { ...prev, [pageNumber]: clone };
+    });
+    socketRef.current?.emit("update_image", { docId, pageNumber, imageId, patch });
+  }, 30);
+
+  // Re-embed all images on a page (useful after moving/resizing)
+  async function reEmbedAllImagesOnPage(pageNumber, imagesToUse = null) {
+    try {
+      const imagesToEmbed = imagesToUse || images;
+      const pageImages = imagesToEmbed[pageNumber] || [];
+      if (pageImages.length === 0) {
+        // If no images on this page, we need to rebuild PDF without images
+        // Load original PDF and re-embed all images from other pages
+        await rebuildPdfWithImages(imagesToEmbed);
+        return;
+      }
+      
+      // Start from original PDF or current edited PDF
+      const src = fileUrl || editedUrl;
+      if (!src) return;
+      
+      const ab = await fetch(src).then(r => r.arrayBuffer());
+      const bytes = new Uint8Array(ab);
+      const pdfDoc = await PDFDocument.load(bytes);
+      
+      // Re-embed all images from all pages
+      const allPages = Object.keys(imagesToEmbed);
+      for (const pageNum of allPages) {
+        const pageIndex = parseInt(pageNum) - 1;
+        const page = pdfDoc.getPages()[pageIndex];
+        const pageHeight = page.getHeight();
+        const imagesOnPage = imagesToEmbed[pageNum] || [];
+        
+        for (const img of imagesOnPage) {
+          const pdfX = img.left / scale;
+          const pdfY = pageHeight - (img.top / scale) - (img.height / scale);
+          const pdfWidth = img.width / scale;
+          const pdfHeight = img.height / scale;
+
+          let pdfImage;
+          try {
+            if (img.imageType === 'image/png') {
+              pdfImage = await pdfDoc.embedPng(img.imageBytes);
+            } else if (img.imageType === 'image/jpeg' || img.imageType === 'image/jpg') {
+              pdfImage = await pdfDoc.embedJpg(img.imageBytes);
+            } else {
+              pdfImage = await pdfDoc.embedPng(img.imageBytes);
+            }
+          } catch {
+            pdfImage = await pdfDoc.embedPng(img.imageBytes);
+          }
+
+          page.drawImage(pdfImage, {
+            x: Math.max(0, pdfX),
+            y: Math.max(0, pdfY),
+            width: pdfWidth,
+            height: pdfHeight,
+          });
+        }
+      }
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes, images: imagesToEmbed, pdfUrl: url });
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to re-embed images:', err);
+    }
+  }
+
+  // Rebuild PDF from original with all current images
+  async function rebuildPdfWithImages(imagesToUse = null) {
+    try {
+      const imagesToEmbed = imagesToUse || images;
+      // Always start from original PDF to avoid duplicate images
+      const src = fileUrl;
+      if (!src) {
+        // Fallback to editedUrl if fileUrl not available
+        const fallbackSrc = editedUrl;
+        if (!fallbackSrc) return;
+        const ab = await fetch(fallbackSrc).then(r => r.arrayBuffer());
+        const bytes = new Uint8Array(ab);
+        const pdfDoc = await PDFDocument.load(bytes);
+        
+        // Clear page and re-embed (simplified - we'll still have the issue but better than nothing)
+        const allPages = Object.keys(imagesToEmbed);
+        for (const pageNum of allPages) {
+          const pageIndex = parseInt(pageNum) - 1;
+          if (pageIndex >= 0 && pageIndex < pdfDoc.getPageCount()) {
+            const page = pdfDoc.getPages()[pageIndex];
+            const pageHeight = page.getHeight();
+            const imagesOnPage = imagesToEmbed[pageNum] || [];
+            
+            for (const img of imagesOnPage) {
+              const pdfX = img.left / scale;
+              const pdfY = pageHeight - (img.top / scale) - (img.height / scale);
+              const pdfWidth = img.width / scale;
+              const pdfHeight = img.height / scale;
+
+              let pdfImage;
+              try {
+                if (img.imageType === 'image/png') {
+                  pdfImage = await pdfDoc.embedPng(img.imageBytes);
+                } else if (img.imageType === 'image/jpeg' || img.imageType === 'image/jpg') {
+                  pdfImage = await pdfDoc.embedJpg(img.imageBytes);
+                } else {
+                  pdfImage = await pdfDoc.embedPng(img.imageBytes);
+                }
+              } catch {
+                pdfImage = await pdfDoc.embedPng(img.imageBytes);
+              }
+
+              page.drawImage(pdfImage, {
+                x: Math.max(0, pdfX),
+                y: Math.max(0, pdfY),
+                width: pdfWidth,
+                height: pdfHeight,
+              });
+            }
+          }
+        }
+        
+        const newBytes = await pdfDoc.save();
+        const blob = new Blob([newBytes], { type: 'application/pdf' });
+        try {
+          const { url } = await uploadPdfBlob(blob);
+          const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+          setEditedUrl(absolute);
+          setPdfBuffer(newBytes);
+          pushHistory(newBytes, absolute);
+          if (docId) await saveDoc(docId, { boxes, images: imagesToEmbed, pdfUrl: url });
+          setDocVersion(v => v + 1);
+        } catch {
+          const url = URL.createObjectURL(blob);
+          setEditedUrl(url);
+          setPdfBuffer(newBytes);
+          pushHistory(newBytes, url);
+          setDocVersion(v => v + 1);
+        }
+        await extractTextItems(newBytes, 'all');
+        return;
+      }
+      
+      const ab = await fetch(src).then(r => r.arrayBuffer());
+      const bytes = new Uint8Array(ab);
+      const pdfDoc = await PDFDocument.load(bytes);
+      
+      // Re-embed all images from all pages
+      const allPages = Object.keys(imagesToEmbed);
+      for (const pageNum of allPages) {
+        const pageIndex = parseInt(pageNum) - 1;
+        const page = pdfDoc.getPages()[pageIndex];
+        const pageHeight = page.getHeight();
+        const imagesOnPage = imagesToEmbed[pageNum] || [];
+        
+        for (const img of imagesOnPage) {
+          const pdfX = img.left / scale;
+          const pdfY = pageHeight - (img.top / scale) - (img.height / scale);
+          const pdfWidth = img.width / scale;
+          const pdfHeight = img.height / scale;
+
+          let pdfImage;
+          try {
+            if (img.imageType === 'image/png') {
+              pdfImage = await pdfDoc.embedPng(img.imageBytes);
+            } else if (img.imageType === 'image/jpeg' || img.imageType === 'image/jpg') {
+              pdfImage = await pdfDoc.embedJpg(img.imageBytes);
+            } else {
+              pdfImage = await pdfDoc.embedPng(img.imageBytes);
+            }
+          } catch {
+            pdfImage = await pdfDoc.embedPng(img.imageBytes);
+          }
+
+          page.drawImage(pdfImage, {
+            x: Math.max(0, pdfX),
+            y: Math.max(0, pdfY),
+            width: pdfWidth,
+            height: pdfHeight,
+          });
+        }
+      }
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes, images: imagesToEmbed, pdfUrl: url });
+        setDocVersion(v => v + 1);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        setEditedUrl(url);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, url);
+        setDocVersion(v => v + 1);
+      }
+      await extractTextItems(newBytes, 'all');
+    } catch (err) {
+      console.error('Failed to rebuild PDF with images:', err);
+    }
+  }
+
+  const deleteImage = async (pageNumber, imageId) => {
+    // Remove from state and get updated images
+    let updatedImages;
+    setImages(prev => {
+      const remaining = (prev[pageNumber] || []).filter(img => img.id !== imageId);
+      updatedImages = { ...prev, [pageNumber]: remaining };
+      return updatedImages;
+    });
+    
+    socketRef.current?.emit("delete_image", { docId, pageNumber, imageId });
+    
+    // Rebuild PDF with remaining images and all text boxes
+    await rebuildPdfWithAllContent(boxes, updatedImages);
+  };
+
+  // Download the current edited PDF
+  async function handleDownload() {
+    try {
+      let blob;
+      if (pdfBuffer && pdfBuffer.length > 0) {
+        // Use current in-memory buffer (most up-to-date)
+        blob = new Blob([pdfBuffer], { type: 'application/pdf' });
+      } else {
+        // Fallback: fetch from URL
+        const url = editedUrl || fileUrl;
+        if (!url) {
+          alert('No PDF available to download');
+          return;
+        }
+        const response = await fetch(url);
+        blob = await response.blob();
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'edited-document.pdf';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Download failed:', err);
+      alert('Failed to download PDF');
+    }
+  }
+
+  // focus inline editor when set
+  useEffect(() => {
+    if (inlineEditorRef.current) {
+      inlineEditorRef.current.focus();
+      const range = document.createRange();
+      range.selectNodeContents(inlineEditorRef.current);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      // If the edited PDF text was bold/italic, enable typing in that style
+      try {
+        const wasBold = editBlock && editBlock.item && editBlock.item.isBold;
+        const wasItalic = editBlock && editBlock.item && editBlock.item.isItalic;
+        if (wasBold) document.execCommand('bold');
+        if (wasItalic) document.execCommand('italic');
+      } catch (err) {
+        // ignore
+      }
+    }
+  }, [editBlock]);
+
+  useEffect(() => {
+    activeBoxIdRef.current = activeBoxId;
+  }, [activeBoxId]);
+
+  // Intentionally do not bind to native text layer clicks.
+  // We open editors only via our invisible overlay rectangles, which
+  // are derived from pdf.js text extraction and thus have stable
+  // coordinates for pdf-lib edits.
+
+  return (
+    <div className="viewer">
+      <div className="toolbar">
+        <strong>Tool:</strong>
+        <button onClick={() => setTool("select")} disabled={tool==="select"}>Select</button>
+        <button onClick={() => setTool("text")} disabled={tool==="text"}>Text</button>
+        <button 
+          onClick={() => {
+            if (tool === "image") {
+              setTool("select");
+              setSelectedImageFile(null);
+            } else {
+              imageInputRef.current?.click();
+            }
+          }} 
+          style={{ marginLeft: 4, backgroundColor: tool === "image" ? "#1976d2" : "", color: tool === "image" ? "white" : "" }}
+        >
+          {tool === "image" ? "Cancel Image" : "Image/Signature"}
+        </button>
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/*"
+          style={{ display: 'none' }}
+          onChange={handleImageFileSelect}
+        />
+        <button onClick={() => setTool("delete")} disabled={tool==="delete"}>Delete</button>
+        <button
+          onClick={() => {
+            // If an inline editor or a focused text box is active, toggle bold for the selection
+            const focused = document.activeElement;
+            const inlineEl = inlineEditorRef.current;
+            const activeBoxEl = activeBoxIdRef.current ? textBoxRefs.current[activeBoxIdRef.current] : null;
+            if (inlineEl && focused === inlineEl) {
+              document.execCommand('bold');
+              inlineEl.focus();
+              return;
+            }
+            if (activeBoxEl && focused === activeBoxEl) {
+              document.execCommand('bold');
+              activeBoxEl.focus();
+              return;
+            }
+            // Fallback: toggle default bold for new boxes
+            setBoldToggle(b=>!b);
+          }}
+          style={{ marginLeft: 12, fontWeight: boldToggle?700:400 }}
+        >
+          B
+        </button>
+        <input type="number" min={6} max={96} value={fontSizeInput}
+               onChange={(e)=>setFontSizeInput(e.target.value)}
+               style={{ width: 64, marginLeft: 8 }} title="Font size" />
+        <input type="color" value={fontColorHex} onChange={(e)=>setFontColorHex(e.target.value)}
+               style={{ marginLeft: 6 }} title="Font color" />
+        <button onClick={handleUndo} disabled={!canUndo} style={{ marginLeft: 8 }}>Undo</button>
+        <button onClick={handleRedo} disabled={!canRedo} style={{ marginLeft: 4 }}>Redo</button>
+        <button onClick={handleDownload} style={{ marginLeft: 12, backgroundColor: '#4CAF50', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer' }}>
+          Download PDF
+        </button>
+        <span style={{flex:1}}/>
+        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.max(0.5, s-0.1)); }}>-</button>
+        <div style={{padding:"0 .5rem"}}>{Math.round(scale*100)}%</div>
+        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.min(2.0, s+0.1)); }}>+</button>
+      </div>
+      {/* removed standalone Add-to-PDF panel to simplify UX for direct inline editing */}
+
+      <Document key={`doc_${docVersion}`} file={editedUrl || fileUrl} onLoadSuccess={onDocLoadSuccess} loading="Loading PDF...">
+        {Array.from(new Array(numPages || 0), (_, i) => (
+          <div
+            key={`page_${i+1}`}
+            className="pageWrap"
+            ref={(el) => (wrapperRefs.current[i+1] = el)}
+            onDoubleClick={(e) => handleQuickAddTextBox(i + 1, e)}
+            onClick={(e) => {
+              if (tool === "text") {
+                addTextBox(i + 1, e);
+              } else if (tool === "image") {
+                addImage(i + 1, e);
+              }
+            }}
+            style={{ position: 'relative', cursor: tool === "image" ? "crosshair" : "default" }}
+          >
+            <Page
+              pageNumber={i + 1}
+              scale={scale}
+              renderAnnotationLayer={false}
+              renderTextLayer={false}
+            />
+
+            {/* Inline editor overlay for real text blocks */}
+            {(pdfTextItems[i+1] || []).map((item, idx) => {
+              const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
+              const topPx = (pageMetrics.height - item.y) * scale;
+              const leftPx = item.x * scale;
+              const heightPx = (item.height || item.fontSize) * scale;
+              const widthPx = (item.width || item.fontSize || 12) * scale;
+              const isThisEditing = editBlock && editBlock.idx === idx;
+              return (
+                <div key={idx}>
+                  {!isThisEditing && (
+                    <div
+                      title={item.str}
+                      style={{
+                        position: 'absolute',
+                        left: leftPx,
+                        top: topPx,
+                        width: widthPx,
+                        height: heightPx,
+                        opacity: 0,
+                        cursor: 'text',
+                        pointerEvents: 'auto',
+                        zIndex: 30,
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditBlock({item, idx, pageNumber: i+1});
+                      }}
+                    />
+                  )}
+                  {isThisEditing && (
+                    <div style={{ position: 'absolute', left: leftPx, top: topPx - (0.15 * heightPx), zIndex: 35 }}>
+                      <div
+                        ref={inlineEditorRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        dir="ltr"
+                        style={{
+                          minWidth: widthPx,
+                          minHeight: heightPx,
+                          outline: '2px dashed #1976d2',
+                          background: 'transparent',
+                          fontSize: item.fontSize * scale,
+                          lineHeight: 1.1,
+                          fontFamily: 'Helvetica, Arial, sans-serif',
+                          color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
+                          padding: '2px 4px',
+                          direction: 'ltr',
+                          textAlign: 'left',
+                          unicodeBidi: 'plaintext',
+                          whiteSpace: 'pre-wrap',
+                          writingMode: 'horizontal-tb',
+                        }}
+                        onBlur={(e)=>{
+                          handleSaveTextEditInline();
+                        }}
+                        onKeyDown={(e)=>{
+                          if(e.key==='Enter') {
+                            e.preventDefault();
+                            handleSaveTextEditInline();
+                          } else if (e.key==='Escape') {
+                            setEditBlock(null);
+                          }
+                        }}
+                        dangerouslySetInnerHTML={{ __html: (
+                          item.isBold && item.isItalic ? ('<b><i>' + escapeHtml(item.str) + '</i></b>') :
+                          item.isBold ? ('<b>' + escapeHtml(item.str) + '</b>') :
+                          item.isItalic ? ('<i>' + escapeHtml(item.str) + '</i>') :
+                          escapeHtml(item.str)
+                        ) }}
+                      />
+                      <button
+                        onClick={(ev) => { ev.stopPropagation(); handleDeleteTextInline(); }}
+                        title="Delete text"
+                        style={{
+                          marginLeft: 6,
+                          background: '#d32f2f',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: 4,
+                          padding: '2px 6px',
+                          cursor: 'pointer',
+                        }}
+                      >Delete</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Image overlay layer */}
+            {(images[i+1] || []).map((img) => {
+              const isSelected = tool === "select";
+              return (
+                <div
+                  key={img.id}
+                  style={{
+                    position: 'absolute',
+                    left: img.left,
+                    top: img.top,
+                    width: img.width,
+                    height: img.height,
+                    border: isSelected ? '2px solid #1976d2' : '2px solid transparent',
+                    cursor: tool === "delete" ? 'pointer' : 'move',
+                    zIndex: 40,
+                    pointerEvents: 'auto',
+                  }}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    if (tool === "delete") {
+                      e.preventDefault();
+                      deleteImage(i+1, img.id);
+                      return;
+                    }
+                    if (tool !== "select") return;
+                    
+                    const startX = e.clientX;
+                    const startY = e.clientY;
+                    const startLeft = img.left;
+                    const startTop = img.top;
+                    let moved = false;
+                    
+                    const move = (ev) => {
+                      const dx = ev.clientX - startX;
+                      const dy = ev.clientY - startY;
+                      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+                        moved = true;
+                      }
+                      if (moved) {
+                        const newLeft = startLeft + dx;
+                        const newTop = startTop + dy;
+                        updateImage(i+1, img.id, { 
+                          left: newLeft, 
+                          top: newTop 
+                        });
+                      }
+                    };
+                    
+                    const up = async () => {
+                      window.removeEventListener("mousemove", move);
+                      window.removeEventListener("mouseup", up);
+                      if (moved) {
+                        // Re-embed after drag ends
+                        setTimeout(async () => {
+                          await rebuildPdfWithAllContent(boxes, images);
+                        }, 100);
+                      }
+                    };
+                    
+                    window.addEventListener("mousemove", move);
+                    window.addEventListener("mouseup", up);
+                  }}
+                >
+                  <img
+                    src={img.imageUrl}
+                    alt="PDF annotation"
+                    style={{
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      pointerEvents: 'none',
+                    }}
+                    draggable={false}
+                  />
+                  {/* Resize handles when selected */}
+                  {isSelected && (
+                    <>
+                      {/* Bottom-right resize handle */}
+                      <div
+                        style={{
+                          position: 'absolute',
+                          right: -5,
+                          bottom: -5,
+                          width: 10,
+                          height: 10,
+                          backgroundColor: '#1976d2',
+                          border: '2px solid white',
+                          borderRadius: '50%',
+                          cursor: 'nwse-resize',
+                          zIndex: 41,
+                        }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          const startX = e.clientX;
+                          const startY = e.clientY;
+                          const startWidth = img.width;
+                          const startHeight = img.height;
+                          const aspectRatio = startWidth / startHeight;
+                          
+                          const move = (ev) => {
+                            const dx = ev.clientX - startX;
+                            const dy = ev.clientY - startY;
+                            const newWidth = Math.max(50, startWidth + dx);
+                            const newHeight = newWidth / aspectRatio;
+                            updateImage(i+1, img.id, { 
+                              width: newWidth, 
+                              height: newHeight 
+                            });
+                          };
+                          
+                          const up = async () => {
+                            window.removeEventListener("mousemove", move);
+                            window.removeEventListener("mouseup", up);
+                            setTimeout(async () => {
+                              await rebuildPdfWithAllContent(boxes, images);
+                            }, 100);
+                          };
+                          
+                          window.addEventListener("mousemove", move);
+                          window.addEventListener("mouseup", up);
+                        }}
+                      />
+                    </>
+                  )}
+                </div>
+              );
+            })}
+
+            <div
+              className="annotation-layer"
+              onClick={(e) => {
+                if (tool === "text") {
+                  addTextBox(i+1, e);
+                } else if (tool === "image") {
+                  addImage(i+1, e);
+                }
+              }}
+              style={{ cursor: tool === "image" ? "crosshair" : tool === "text" ? "text" : "default" }}
+            >
+              {(boxes[i+1] || []).map((b) => {
+                const boxFontSize = b.fontSize || Number(fontSizeInput) || 12;
+                const boxColor = b.color || fontColorHex;
+                const boxIsBold = b.isBold !== undefined ? b.isBold : boldToggle;
+                
+                return (
+                <div
+                  key={b.id}
+                  ref={(el) => { if (el) textBoxRefs.current[b.id] = el; }}
+                  className="text-box"
+                  dir="ltr"
+                  style={{
+                    position: 'absolute',
+                    left:b.left, 
+                    top:b.top, 
+                    width:b.width, 
+                    height:b.height,
+                    opacity: b.locked ? 0.6 : 1,
+                    border: tool === "select" ? '2px dashed #1976d2' : '1px solid #ccc',
+                    padding: '2px 4px',
+                    fontSize: boxFontSize * scale,
+                    fontWeight: boxIsBold ? 700 : 400,
+                    color: boxColor,
+                    fontFamily: 'Helvetica, Arial, sans-serif',
+                    // backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                    backgroundColor: 'transparent',
+                    outline: 'none',
+                    cursor: 'text',
+                    zIndex: 50,
+                    direction: 'ltr',
+                    textAlign: 'left',
+                    unicodeBidi: 'plaintext',
+                    whiteSpace: 'pre-wrap',
+                    writingMode: 'horizontal-tb',
+                  }}
+                  contentEditable
+                  suppressContentEditableWarning
+                  tabIndex={0}
+                  onFocus={(e) => {
+                    setActiveBoxId(b.id);
+                    activeBoxIdRef.current = b.id;
+                    lock(b.id);
+                    const node = e.currentTarget.firstChild;
+                    const len = node?.textContent?.length || 0;
+                    rememberCaret(b.id, len);
+                    restoreCaret(b.id);
+                  }}
+                  onBlur={async () => {
+                    setActiveBoxId(cur => (cur === b.id ? null : cur));
+                    activeBoxIdRef.current = null;
+                    unlock(b.id);
+                    // Embed text box into PDF when done editing
+                    const finalText = textBoxRefs.current[b.id]?.textContent || "";
+                    if (finalText.trim() && finalText !== "Type...") {
+                      // Embed text into PDF first, then remove box from UI
+                      setTimeout(async () => {
+                        await rebuildPdfWithAllContent(boxes, images);
+                        // Remove the box from UI after text is embedded
+                        setBoxes(prev => {
+                          const pageBoxes = prev[i + 1] || [];
+                          const remaining = pageBoxes.filter(bx => bx.id !== b.id);
+                          return { ...prev, [i + 1]: remaining };
+                        });
+                        socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
+                      }, 200);
+                    } else {
+                      // If empty, just remove the box immediately
+                      setBoxes(prev => {
+                        const pageBoxes = prev[i + 1] || [];
+                        const remaining = pageBoxes.filter(bx => bx.id !== b.id);
+                        return { ...prev, [i + 1]: remaining };
+                      });
+                      socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      e.currentTarget.blur(); // This triggers onBlur which saves the text
+                    }
+                  }}
+                  onMouseDown={(e) => {
+                    if (tool === "delete") {
+                      e.preventDefault();
+                      deleteBox(i+1, b.id);
+                      return;
+                    }
+                    if (tool !== "select") return;
+                    const startX = e.clientX, startY = e.clientY;
+                    let moved = false;
+                    const move = (ev) => {
+                      const dx = ev.clientX - startX, dy = ev.clientY - startY;
+                      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+                      if (moved) {
+                        const pageBoxes = boxes[i + 1] || [];
+                        const bi = pageBoxes.findIndex(bx => bx.id === b.id);
+                        const start = { ...pageBoxes[bi] };
+                        const updated = { ...start, left: start.left + dx, top: start.top + dy };
+                        const clone = [...pageBoxes]; clone[bi] = updated;
+                        setBoxes(prev => ({ ...prev, [i + 1]: clone }));
+                      }
+                    };
+                    const up = async () => {
+                      window.removeEventListener("mousemove", move);
+                      window.removeEventListener("mouseup", up);
+                      if (moved) {
+                        e.preventDefault();
+                        // Re-embed after moving
+                        setTimeout(async () => {
+                          await rebuildPdfWithAllContent(boxes, images);
+                        }, 100);
+                      }
+                    };
+                    window.addEventListener("mousemove", move);
+                    window.addEventListener("mouseup", up);
+                  }}
+                  onInput={(e) => {
+                    const selection = window.getSelection();
+                    if (selection && selection.rangeCount > 0) {
+                      try {
+                        const range = selection.getRangeAt(0);
+                        rememberCaret(b.id, range.endOffset);
+                      } catch {}
+                    }
+                    const pageBoxes = boxes[i + 1] || [];
+                    const idx = pageBoxes.findIndex(x => x.id === b.id);
+                    const clone = [...pageBoxes];
+                    clone[idx] = { ...clone[idx], text: e.currentTarget.textContent || "" };
+                    setBoxes(prev => ({ ...prev, [i + 1]: clone }));
+                    requestAnimationFrame(() => {
+                      if (activeBoxIdRef.current === b.id) restoreCaret(b.id, false);
+                    });
+                  }}
+                >
+                  {b.text}
+                </div>
+              );
+              })}
+            </div>
+          </div>
+        ))}
+      </Document>
+    </div>
+  );
+}

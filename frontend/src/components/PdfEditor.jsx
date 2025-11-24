@@ -57,6 +57,74 @@ export default function PdfEditor({ fileUrl, docId }) {
   const [activeBoxId, setActiveBoxId] = useState(null);
   const activeBoxIdRef = useRef(null);
 
+  // simple mobile detection
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const update = () => {
+      if (typeof window !== "undefined") {
+        setIsMobile(window.innerWidth <= 768);
+      }
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  // common styles (inline, responsive)
+  const viewerStyle = {
+    width: "100%",
+    height: "100vh",
+    display: "flex",
+    flexDirection: "column",
+    backgroundColor: "#f3f4f6",
+    boxSizing: "border-box",
+  };
+
+  const toolbarStyle = {
+    display: "flex",
+    flexWrap: isMobile ? "wrap" : "nowrap",
+    gap: 8,
+    alignItems: "center",
+    padding: isMobile ? "6px 8px" : "8px 12px",
+    borderBottom: "1px solid #e5e7eb",
+    backgroundColor: "#ffffff",
+    position: "sticky",
+    top: 0,
+    zIndex: 100,
+    overflowX: "auto",
+  };
+
+  const toolbarButtonBase = {
+    padding: isMobile ? "4px 6px" : "4px 10px",
+    fontSize: isMobile ? 11 : 13,
+    borderRadius: 4,
+    border: "1px solid #d1d5db",
+    backgroundColor: "#f9fafb",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  };
+
+  const zoomButtonStyle = {
+    ...toolbarButtonBase,
+    minWidth: 30,
+    padding: "2px 6px",
+  };
+
+  const docContainerStyle = {
+    flex: 1,
+    overflowY: "auto",
+    WebkitOverflowScrolling: "touch",
+    padding: isMobile ? "8px 0 16px" : "16px 0 24px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+  };
+
+  const zoomDisplayStyle = {
+    padding: "0 .5rem",
+    fontSize: isMobile ? 11 : 13,
+  };
+
   // Ensure we always have valid PDF bytes for pdf-lib
   async function ensurePdfBytes() {
     if (pdfBuffer && pdfBuffer.length > 6) {
@@ -177,7 +245,7 @@ export default function PdfEditor({ fileUrl, docId }) {
     const metrics = pageSizes[1] || DEFAULT_PAGE_SIZE;
     if (!wrap || !metrics || !metrics.width) return;
     try {
-      const availableWidth = wrap.clientWidth || wrap.offsetWidth || window.innerWidth;
+      const availableWidth = wrap.clientWidth || wrap.offsetWidth || (typeof window !== "undefined" ? window.innerWidth : metrics.width);
       if (availableWidth <= 0) return;
       const targetScale = availableWidth / metrics.width;
       // Clamp to sensible bounds
@@ -309,6 +377,16 @@ export default function PdfEditor({ fileUrl, docId }) {
     return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
   }
 
+  // Escape text for safe innerHTML insertion
+  function escapeHtml(unsafe) {
+    return String(unsafe)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
   function onDocLoadSuccess({ numPages }) {
     setNumPages(numPages);
   }
@@ -357,93 +435,104 @@ export default function PdfEditor({ fileUrl, docId }) {
 
     // Use original font properties - don't override with user inputs
     const item = editBlock.item;
-    const originalFontSize = item.fontSize;
-    const originalIsBold = item.isBold || false;
-    const originalIsItalic = item.isItalic || false;
-    
-    // Determine font based on original properties
-    let font;
-    if (originalIsBold && originalIsItalic) {
-      font = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique);
-    } else if (originalIsBold) {
-      font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    } else if (originalIsItalic) {
-      font = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
-    } else {
-      font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    }
+    const fontSizeToUse = item.fontSize || 12;
 
-    // Use original font size (not user input)
-    const fontSizeToUse = originalFontSize;
-    
     // Use original color if available, otherwise default to black
-    // Ensure color values are numbers in 0-1 range (pdf-lib requirement)
     const originalColor = item.color || { r: 0, g: 0, b: 0 };
     const normalizeColor = (val) => {
       if (typeof val !== 'number') {
         const num = parseFloat(val);
         if (isNaN(num)) return 0;
-        // If value is > 1, assume it's 0-255 range and normalize
         return num > 1 ? num / 255 : num;
       }
-      // If value is > 1, assume it's 0-255 range and normalize
       return val > 1 ? val / 255 : val;
     };
-    
     const r = Math.max(0, Math.min(1, normalizeColor(originalColor.r)));
     const g = Math.max(0, Math.min(1, normalizeColor(originalColor.g)));
     const b = Math.max(0, Math.min(1, normalizeColor(originalColor.b)));
-    
     const textColor = rgb(r, g, b);
 
-    // Calculate precise text dimensions for covering old text
-    // We need to cover ONLY the text area, no more, no less
-    const oldTextWidth = font.widthOfTextAtSize(item.str, fontSizeToUse);
-    const newTextWidth = font.widthOfTextAtSize(newStr, fontSizeToUse);
-    
-    // Use the maximum width needed (old or new text), add tiny margin for safety
+    // Get HTML from the inline editor (prefer rich HTML to preserve bold runs)
+    const editorHtml = inlineEditorRef.current?.innerHTML || newStr || item.str;
+
+    // Parse HTML into runs with bold/italic flags
+    const parseRunsFromHtml = (html) => {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = html;
+      const runs = [];
+      const walk = (node, bold = false, italic = false) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const txt = node.nodeValue.replace(/\u00A0/g, ' ');
+          if (txt.length > 0) runs.push({ text: txt, bold, italic });
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        let nb = bold;
+        let ni = italic;
+        const tag = node.tagName && node.tagName.toLowerCase();
+        if (tag === 'b' || tag === 'strong') nb = true;
+        if (tag === 'i' || tag === 'em') ni = true;
+        const fw = node.style && node.style.fontWeight;
+        if (fw) {
+          const num = parseInt(fw, 10);
+          if (!isNaN(num)) nb = num >= 600;
+          else if (fw === 'bold' || fw === '700') nb = true;
+        }
+        const fs = node.style && node.style.fontStyle;
+        if (fs === 'italic' || fs === 'oblique') ni = true;
+        // Recurse children
+        for (const child of Array.from(node.childNodes)) walk(child, nb, ni);
+      };
+      for (const child of Array.from(wrapper.childNodes)) walk(child, false, false);
+      return runs;
+    };
+
+    const runs = parseRunsFromHtml(editorHtml);
+
+    // Calculate cover rect dimensions using a regular font to measure
+    const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const oldTextWidth = regularFont.widthOfTextAtSize(item.str, fontSizeToUse);
+    // sum new widths
+    const newTextWidth = runs.reduce((s, r) => {
+      const f = r.bold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica;
+      // Use embedded font for measurement
+      try {
+        const embedded = pdfDoc.embedFont ? pdfDoc.embedFont(f) : null; // placeholder
+      } catch {}
+      // fallback to regular measurement
+      return s + regularFont.widthOfTextAtSize(r.text, fontSizeToUse);
+    }, 0);
     const textWidth = Math.max(oldTextWidth, newTextWidth) + 2;
-    
-    // Use the actual measured height from the extracted text item
-    // This gives us the real height of the text glyphs
+
     const actualHeight = item.height || (fontSizeToUse * 0.7);
-    
-    // In PDF coordinates, y is the baseline (bottom of text)
-    // Text typically extends from baseline upward
-    // We need to position the rectangle to cover the text properly
     const baselineY = item.y;
-    
-    // Text extends upward from baseline
-    // Adjust Y to start slightly below baseline to cover descenders if any
-    // Then height should cover up to cap height
-    const coverY = baselineY - (actualHeight * 0.2); // Small padding for descenders
-    const coverHeight = actualHeight * 1.1; // Cover actual height plus small margin
-    
-    // Try to sample the page background color under the text and use that
-    // as the cover color. If sampling fails, fall back to white.
+    const coverY = baselineY - (actualHeight * 0.2);
+    const coverHeight = actualHeight * 1.1;
+
+    // Sample background color and use that to cover the old text
     let coverColor = { r: 1, g: 1, b: 1 };
     try {
       const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, item);
       if (sampled) coverColor = sampled;
     } catch {}
 
-    page.drawRectangle({
-      x: item.x - 1, // Tiny left margin
-      y: coverY,
-      width: textWidth,
-      height: coverHeight,
-      color: rgb(coverColor.r, coverColor.g, coverColor.b),
-      opacity: 1.0,
-    });
+    page.drawRectangle({ x: item.x - 1, y: coverY, width: textWidth, height: coverHeight, color: rgb(coverColor.r, coverColor.g, coverColor.b), opacity: 1.0 });
 
-    // Write new text at same baseline position with original properties
-    page.drawText(newStr, {
-      x: item.x,
-      y: item.y,
-      size: fontSizeToUse, // Use original font size
-      font, // Use original font style
-      color: textColor, // Use original color
-    });
+    // Embed fonts we'll need
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    let fontItalic, fontBoldItalic;
+    try { fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique); } catch { fontItalic = fontRegular; }
+    try { fontBoldItalic = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique); } catch { fontBoldItalic = fontBold; }
+
+    // Draw each run sequentially, advancing X by measured widths
+    let curX = item.x;
+    for (const run of runs) {
+      const useFont = run.bold && run.italic ? fontBoldItalic : run.bold ? fontBold : run.italic ? fontItalic : fontRegular;
+      const w = useFont.widthOfTextAtSize(run.text, fontSizeToUse);
+      page.drawText(run.text, { x: curX, y: item.y, size: fontSizeToUse, font: useFont, color: textColor });
+      curX += w;
+    }
 
     const newBytes = await pdfDoc.save(); // Uint8Array
     const blob = new Blob([newBytes], { type: 'application/pdf' });
@@ -1372,6 +1461,15 @@ export default function PdfEditor({ fileUrl, docId }) {
       const sel = window.getSelection();
       sel.removeAllRanges();
       sel.addRange(range);
+      // If the edited PDF text was bold/italic, enable typing in that style
+      try {
+        const wasBold = editBlock && editBlock.item && editBlock.item.isBold;
+        const wasItalic = editBlock && editBlock.item && editBlock.item.isItalic;
+        if (wasBold) document.execCommand('bold');
+        if (wasItalic) document.execCommand('italic');
+      } catch (err) {
+        // ignore
+      }
     }
   }, [editBlock]);
 
@@ -1385,11 +1483,29 @@ export default function PdfEditor({ fileUrl, docId }) {
   // coordinates for pdf-lib edits.
 
   return (
-    <div className="viewer">
-      <div className="toolbar">
-        <strong>Tool:</strong>
-        <button onClick={() => setTool("select")} disabled={tool==="select"}>Select</button>
-        <button onClick={() => setTool("text")} disabled={tool==="text"}>Text</button>
+    <div className="viewer" style={viewerStyle}>
+      <div className="toolbar" style={toolbarStyle}>
+        <strong style={{ fontSize: isMobile ? 11 : 13 }}>Tool:</strong>
+        <button
+          onClick={() => setTool("select")}
+          disabled={tool==="select"}
+          style={{
+            ...toolbarButtonBase,
+            opacity: tool==="select" ? 0.7 : 1,
+          }}
+        >
+          Select
+        </button>
+        <button
+          onClick={() => setTool("text")}
+          disabled={tool==="text"}
+          style={{
+            ...toolbarButtonBase,
+            opacity: tool==="text" ? 0.7 : 1,
+          }}
+        >
+          Text
+        </button>
         <button 
           onClick={() => {
             if (tool === "image") {
@@ -1399,7 +1515,12 @@ export default function PdfEditor({ fileUrl, docId }) {
               imageInputRef.current?.click();
             }
           }} 
-          style={{ marginLeft: 4, backgroundColor: tool === "image" ? "#1976d2" : "", color: tool === "image" ? "white" : "" }}
+          style={{
+            ...toolbarButtonBase,
+            marginLeft: 4,
+            backgroundColor: tool === "image" ? "#1976d2" : "#f9fafb",
+            color: tool === "image" ? "white" : "#111827",
+          }}
         >
           {tool === "image" ? "Cancel Image" : "Image/Signature"}
         </button>
@@ -1410,419 +1531,550 @@ export default function PdfEditor({ fileUrl, docId }) {
           style={{ display: 'none' }}
           onChange={handleImageFileSelect}
         />
-        <button onClick={() => setTool("delete")} disabled={tool==="delete"}>Delete</button>
-        <button onClick={()=>setBoldToggle(b=>!b)} style={{ marginLeft: 12, fontWeight: boldToggle?700:400 }}>
+        <button
+          onClick={() => setTool("delete")}
+          disabled={tool==="delete"}
+          style={{
+            ...toolbarButtonBase,
+            opacity: tool==="delete" ? 0.7 : 1,
+          }}
+        >
+          Delete
+        </button>
+        <button
+          onClick={() => {
+            // If an inline editor or a focused text box is active, toggle bold for the selection
+            const focused = document.activeElement;
+            const inlineEl = inlineEditorRef.current;
+            const activeBoxEl = activeBoxIdRef.current ? textBoxRefs.current[activeBoxIdRef.current] : null;
+            if (inlineEl && focused === inlineEl) {
+              document.execCommand('bold');
+              inlineEl.focus();
+              return;
+            }
+            if (activeBoxEl && focused === activeBoxEl) {
+              document.execCommand('bold');
+              activeBoxEl.focus();
+              return;
+            }
+            // Fallback: toggle default bold for new boxes
+            setBoldToggle(b=>!b);
+          }}
+          style={{
+            ...toolbarButtonBase,
+            marginLeft: 12,
+            fontWeight: boldToggle?700:400,
+          }}
+        >
           B
         </button>
-        <input type="number" min={6} max={96} value={fontSizeInput}
-               onChange={(e)=>setFontSizeInput(e.target.value)}
-               style={{ width: 64, marginLeft: 8 }} title="Font size" />
-        <input type="color" value={fontColorHex} onChange={(e)=>setFontColorHex(e.target.value)}
-               style={{ marginLeft: 6 }} title="Font color" />
-        <button onClick={handleUndo} disabled={!canUndo} style={{ marginLeft: 8 }}>Undo</button>
-        <button onClick={handleRedo} disabled={!canRedo} style={{ marginLeft: 4 }}>Redo</button>
-        <button onClick={handleDownload} style={{ marginLeft: 12, backgroundColor: '#4CAF50', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer' }}>
+        <input
+          type="number"
+          min={6}
+          max={96}
+          value={fontSizeInput}
+          onChange={(e)=>setFontSizeInput(e.target.value)}
+          style={{
+            width: 64,
+            marginLeft: 8,
+            fontSize: isMobile ? 11 : 13,
+            padding: "2px 4px",
+            borderRadius: 4,
+            border: "1px solid #d1d5db",
+          }}
+          title="Font size"
+        />
+        <input
+          type="color"
+          value={fontColorHex}
+          onChange={(e)=>setFontColorHex(e.target.value)}
+          style={{
+            marginLeft: 6,
+            width: 28,
+            height: 24,
+            padding: 0,
+            border: "1px solid #d1d5db",
+            borderRadius: 4,
+          }}
+          title="Font color"
+        />
+        <button
+          onClick={handleUndo}
+          disabled={!canUndo}
+          style={{
+            ...toolbarButtonBase,
+            marginLeft: 8,
+            opacity: canUndo ? 1 : 0.5,
+          }}
+        >
+          Undo
+        </button>
+        <button
+          onClick={handleRedo}
+          disabled={!canRedo}
+          style={{
+            ...toolbarButtonBase,
+            marginLeft: 4,
+            opacity: canRedo ? 1 : 0.5,
+          }}
+        >
+          Redo
+        </button>
+        <button
+          onClick={handleDownload}
+          style={{
+            ...toolbarButtonBase,
+            marginLeft: 12,
+            backgroundColor: '#4CAF50',
+            color: 'white',
+            border: 'none',
+          }}
+        >
           Download PDF
         </button>
-        <span style={{flex:1}}/>
-        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.max(0.5, s-0.1)); }}>-</button>
-        <div style={{padding:"0 .5rem"}}>{Math.round(scale*100)}%</div>
-        <button onClick={() => { setAutoFitEnabled(false); setScale(s => Math.min(2.0, s+0.1)); }}>+</button>
+        <span style={{ flex: 1 }} />
+        <button
+          onClick={() => { setAutoFitEnabled(false); setScale(s => Math.max(0.5, s-0.1)); }}
+          style={zoomButtonStyle}
+        >
+          -
+        </button>
+        <div style={zoomDisplayStyle}>{Math.round(scale*100)}%</div>
+        <button
+          onClick={() => { setAutoFitEnabled(false); setScale(s => Math.min(2.0, s+0.1)); }}
+          style={zoomButtonStyle}
+        >
+          +
+        </button>
       </div>
-      {/* removed standalone Add-to-PDF panel to simplify UX for direct inline editing */}
 
-      <Document key={`doc_${docVersion}`} file={editedUrl || fileUrl} onLoadSuccess={onDocLoadSuccess} loading="Loading PDF...">
-        {Array.from(new Array(numPages || 0), (_, i) => (
-          <div
-            key={`page_${i+1}`}
-            className="pageWrap"
-            ref={(el) => (wrapperRefs.current[i+1] = el)}
-            onDoubleClick={(e) => handleQuickAddTextBox(i + 1, e)}
-            onClick={(e) => {
-              if (tool === "text") {
-                addTextBox(i + 1, e);
-              } else if (tool === "image") {
-                addImage(i + 1, e);
-              }
-            }}
-            style={{ position: 'relative', cursor: tool === "image" ? "crosshair" : "default" }}
-          >
-            <Page
-              pageNumber={i + 1}
-              scale={scale}
-              renderAnnotationLayer={false}
-              renderTextLayer={false}
-            />
+      <div style={docContainerStyle}>
+        <Document
+          key={`doc_${docVersion}`}
+          file={editedUrl || fileUrl}
+          onLoadSuccess={onDocLoadSuccess}
+          loading="Loading PDF..."
+        >
+          {Array.from(new Array(numPages || 0), (_, i) => (
+            <div
+              key={`page_${i+1}`}
+              className="pageWrap"
+              ref={(el) => (wrapperRefs.current[i+1] = el)}
+              onDoubleClick={(e) => handleQuickAddTextBox(i + 1, e)}
+              onClick={(e) => {
+                if (tool === "text") {
+                  addTextBox(i + 1, e);
+                } else if (tool === "image") {
+                  addImage(i + 1, e);
+                }
+              }}
+              style={{
+                position: 'relative',
+                cursor: tool === "image" ? "crosshair" : "default",
+                margin: "0 auto 16px",
+                backgroundColor: "#ffffff",
+                padding: isMobile ? 4 : 8,
+                boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
+                width: "100%",
+                maxWidth: isMobile ? "100%" : "900px",
+                boxSizing: "border-box",
+              }}
+            >
+              <Page
+                pageNumber={i + 1}
+                scale={scale}
+                renderAnnotationLayer={false}
+                renderTextLayer={false}
+              />
 
-            {/* Inline editor overlay for real text blocks */}
-            {(pdfTextItems[i+1] || []).map((item, idx) => {
-              const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
-              const topPx = (pageMetrics.height - item.y) * scale;
-              const leftPx = item.x * scale;
-              const heightPx = (item.height || item.fontSize) * scale;
-              const widthPx = (item.width || item.fontSize || 12) * scale;
-              const isThisEditing = editBlock && editBlock.idx === idx;
-              return (
-                <div key={idx}>
-                  {!isThisEditing && (
-                    <div
-                      title={item.str}
-                      style={{
-                        position: 'absolute',
-                        left: leftPx,
-                        top: topPx,
-                        width: widthPx,
-                        height: heightPx,
-                        opacity: 0,
-                        cursor: 'text',
-                        pointerEvents: 'auto',
-                        zIndex: 30,
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setEditBlock({item, idx, pageNumber: i+1});
-                      }}
-                    />
-                  )}
-                  {isThisEditing && (
-                    <div style={{ position: 'absolute', left: leftPx, top: topPx - (0.15 * heightPx), zIndex: 35 }}>
+              {/* Inline editor overlay for real text blocks */}
+              {(pdfTextItems[i+1] || []).map((item, idx) => {
+                const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
+                const topPx = (pageMetrics.height - item.y) * scale;
+                const leftPx = item.x * scale;
+                const heightPx = (item.height || item.fontSize) * scale;
+                const widthPx = (item.width || item.fontSize || 12) * scale;
+                const isThisEditing = editBlock && editBlock.idx === idx;
+                return (
+                  <div key={idx}>
+                    {!isThisEditing && (
                       <div
-                        ref={inlineEditorRef}
-                        contentEditable
-                        suppressContentEditableWarning
-                        dir="ltr"
+                        title={item.str}
                         style={{
-                          minWidth: widthPx,
-                          minHeight: heightPx,
-                          outline: '2px dashed #1976d2',
-                          background: 'transparent',
-                          fontSize: item.fontSize * scale,
-                          lineHeight: 1.1,
-                          fontWeight: item.isBold ? 700 : 400,
-                          fontStyle: item.isItalic ? 'italic' : 'normal',
-                          fontFamily: 'Helvetica, Arial, sans-serif',
-                          color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
-                          padding: '2px 4px',
-                          direction: 'ltr',
-                          textAlign: 'left',
-                          unicodeBidi: 'plaintext',
-                          whiteSpace: 'pre-wrap',
-                          writingMode: 'horizontal-tb',
+                          position: 'absolute',
+                          left: leftPx,
+                          top: topPx,
+                          width: widthPx,
+                          height: heightPx,
+                          opacity: 0,
+                          cursor: 'text',
+                          pointerEvents: 'auto',
+                          zIndex: 30,
                         }}
-                        onBlur={(e)=>{
-                          const val = e.currentTarget.textContent || item.str;
-                          handleSaveTextEditInline(val);
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditBlock({item, idx, pageNumber: i+1});
                         }}
-                        onKeyDown={(e)=>{
-                          if(e.key==='Enter') {
-                            e.preventDefault();
-                            const val = e.currentTarget.textContent || item.str;
-                            handleSaveTextEditInline(val);
-                          } else if (e.key==='Escape') {
-                            setEditBlock(null);
-                          }
-                        }}
-                      >{item.str}</div>
-                      <button
-                        onClick={(ev) => { ev.stopPropagation(); handleDeleteTextInline(); }}
-                        title="Delete text"
-                        style={{
-                          marginLeft: 6,
-                          background: '#d32f2f',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: 4,
-                          padding: '2px 6px',
-                          cursor: 'pointer',
-                        }}
-                      >Delete</button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            {/* Image overlay layer */}
-            {(images[i+1] || []).map((img) => {
-              const isSelected = tool === "select";
-              return (
-                <div
-                  key={img.id}
-                  style={{
-                    position: 'absolute',
-                    left: img.left,
-                    top: img.top,
-                    width: img.width,
-                    height: img.height,
-                    border: isSelected ? '2px solid #1976d2' : '2px solid transparent',
-                    cursor: tool === "delete" ? 'pointer' : 'move',
-                    zIndex: 40,
-                    pointerEvents: 'auto',
-                  }}
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    if (tool === "delete") {
-                      e.preventDefault();
-                      deleteImage(i+1, img.id);
-                      return;
-                    }
-                    if (tool !== "select") return;
-                    
-                    const startX = e.clientX;
-                    const startY = e.clientY;
-                    const startLeft = img.left;
-                    const startTop = img.top;
-                    let moved = false;
-                    
-                    const move = (ev) => {
-                      const dx = ev.clientX - startX;
-                      const dy = ev.clientY - startY;
-                      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
-                        moved = true;
-                      }
-                      if (moved) {
-                        const newLeft = startLeft + dx;
-                        const newTop = startTop + dy;
-                        updateImage(i+1, img.id, { 
-                          left: newLeft, 
-                          top: newTop 
-                        });
-                      }
-                    };
-                    
-                    const up = async () => {
-                      window.removeEventListener("mousemove", move);
-                      window.removeEventListener("mouseup", up);
-                      if (moved) {
-                        // Re-embed after drag ends
-                        setTimeout(async () => {
-                          await rebuildPdfWithAllContent(boxes, images);
-                        }, 100);
-                      }
-                    };
-                    
-                    window.addEventListener("mousemove", move);
-                    window.addEventListener("mouseup", up);
-                  }}
-                >
-                  <img
-                    src={img.imageUrl}
-                    alt="PDF annotation"
-                    style={{
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain',
-                      pointerEvents: 'none',
-                    }}
-                    draggable={false}
-                  />
-                  {/* Resize handles when selected */}
-                  {isSelected && (
-                    <>
-                      {/* Bottom-right resize handle */}
+                      />
+                    )}
+                    {isThisEditing && (
                       <div
                         style={{
                           position: 'absolute',
-                          right: -5,
-                          bottom: -5,
-                          width: 10,
-                          height: 10,
-                          backgroundColor: '#1976d2',
-                          border: '2px solid white',
-                          borderRadius: '50%',
-                          cursor: 'nwse-resize',
-                          zIndex: 41,
+                          left: leftPx,
+                          top: topPx - (0.15 * heightPx),
+                          zIndex: 35,
                         }}
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          const startX = e.clientX;
-                          const startY = e.clientY;
-                          const startWidth = img.width;
-                          const startHeight = img.height;
-                          const aspectRatio = startWidth / startHeight;
-                          
-                          const move = (ev) => {
-                            const dx = ev.clientX - startX;
-                            const dy = ev.clientY - startY;
-                            const newWidth = Math.max(50, startWidth + dx);
-                            const newHeight = newWidth / aspectRatio;
-                            updateImage(i+1, img.id, { 
-                              width: newWidth, 
-                              height: newHeight 
-                            });
-                          };
-                          
-                          const up = async () => {
-                            window.removeEventListener("mousemove", move);
-                            window.removeEventListener("mouseup", up);
-                            setTimeout(async () => {
-                              await rebuildPdfWithAllContent(boxes, images);
-                            }, 100);
-                          };
-                          
-                          window.addEventListener("mousemove", move);
-                          window.addEventListener("mouseup", up);
-                        }}
-                      />
-                    </>
-                  )}
-                </div>
-              );
-            })}
+                      >
+                        <div
+                          ref={inlineEditorRef}
+                          contentEditable
+                          suppressContentEditableWarning
+                          dir="ltr"
+                          style={{
+                            minWidth: widthPx,
+                            minHeight: heightPx,
+                            outline: '2px dashed #1976d2',
+                            background: 'transparent',
+                            fontSize: item.fontSize * scale,
+                            lineHeight: 1.1,
+                            fontFamily: 'Helvetica, Arial, sans-serif',
+                            color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
+                            padding: '2px 4px',
+                            direction: 'ltr',
+                            textAlign: 'left',
+                            unicodeBidi: 'plaintext',
+                            whiteSpace: 'pre-wrap',
+                            writingMode: 'horizontal-tb',
+                            borderRadius: 4,
+                            backgroundColor: "rgba(255,255,255,0.9)",
+                          }}
+                          onBlur={(e)=>{
+                            handleSaveTextEditInline();
+                          }}
+                          onKeyDown={(e)=>{
+                            if(e.key==='Enter') {
+                              e.preventDefault();
+                              handleSaveTextEditInline();
+                            } else if (e.key==='Escape') {
+                              setEditBlock(null);
+                            }
+                          }}
+                          dangerouslySetInnerHTML={{ __html: (
+                            item.isBold && item.isItalic ? ('<b><i>' + escapeHtml(item.str) + '</i></b>') :
+                            item.isBold ? ('<b>' + escapeHtml(item.str) + '</b>') :
+                            item.isItalic ? ('<i>' + escapeHtml(item.str) + '</i>') :
+                            escapeHtml(item.str)
+                          ) }}
+                        />
+                        <button
+                          onClick={(ev) => { ev.stopPropagation(); handleDeleteTextInline(); }}
+                          title="Delete text"
+                          style={{
+                            marginLeft: 6,
+                            marginTop: 4,
+                            background: '#d32f2f',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: 4,
+                            padding: '2px 6px',
+                            cursor: 'pointer',
+                            fontSize: isMobile ? 11 : 12,
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
 
-            <div
-              className="annotation-layer"
-              onClick={(e) => {
-                if (tool === "text") {
-                  addTextBox(i+1, e);
-                } else if (tool === "image") {
-                  addImage(i+1, e);
-                }
-              }}
-              style={{ cursor: tool === "image" ? "crosshair" : tool === "text" ? "text" : "default" }}
-            >
-              {(boxes[i+1] || []).map((b) => {
-                const boxFontSize = b.fontSize || Number(fontSizeInput) || 12;
-                const boxColor = b.color || fontColorHex;
-                const boxIsBold = b.isBold !== undefined ? b.isBold : boldToggle;
-                
+              {/* Image overlay layer */}
+              {(images[i+1] || []).map((img) => {
+                const isSelected = tool === "select";
                 return (
-                <div
-                  key={b.id}
-                  ref={(el) => { if (el) textBoxRefs.current[b.id] = el; }}
-                  className="text-box"
-                  dir="ltr"
-                  style={{
-                    position: 'absolute',
-                    left:b.left, 
-                    top:b.top, 
-                    width:b.width, 
-                    height:b.height,
-                    opacity: b.locked ? 0.6 : 1,
-                    border: tool === "select" ? '2px dashed #1976d2' : '1px solid #ccc',
-                    padding: '2px 4px',
-                    fontSize: boxFontSize * scale,
-                    fontWeight: boxIsBold ? 700 : 400,
-                    color: boxColor,
-                    fontFamily: 'Helvetica, Arial, sans-serif',
-                    // backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                    backgroundColor: 'transparent',
-                    outline: 'none',
-                    cursor: 'text',
-                    zIndex: 50,
-                    direction: 'ltr',
-                    textAlign: 'left',
-                    unicodeBidi: 'plaintext',
-                    whiteSpace: 'pre-wrap',
-                    writingMode: 'horizontal-tb',
-                  }}
-                  contentEditable
-                  suppressContentEditableWarning
-                  tabIndex={0}
-                  onFocus={(e) => {
-                    setActiveBoxId(b.id);
-                    activeBoxIdRef.current = b.id;
-                    lock(b.id);
-                    const node = e.currentTarget.firstChild;
-                    const len = node?.textContent?.length || 0;
-                    rememberCaret(b.id, len);
-                    restoreCaret(b.id);
-                  }}
-                  onBlur={async () => {
-                    setActiveBoxId(cur => (cur === b.id ? null : cur));
-                    activeBoxIdRef.current = null;
-                    unlock(b.id);
-                    // Embed text box into PDF when done editing
-                    const finalText = textBoxRefs.current[b.id]?.textContent || "";
-                    if (finalText.trim() && finalText !== "Type...") {
-                      // Embed text into PDF first, then remove box from UI
-                      setTimeout(async () => {
-                        await rebuildPdfWithAllContent(boxes, images);
-                        // Remove the box from UI after text is embedded
+                  <div
+                    key={img.id}
+                    style={{
+                      position: 'absolute',
+                      left: img.left,
+                      top: img.top,
+                      width: img.width,
+                      height: img.height,
+                      border: isSelected ? '2px solid #1976d2' : '2px solid transparent',
+                      cursor: tool === "delete" ? 'pointer' : 'move',
+                      zIndex: 40,
+                      pointerEvents: 'auto',
+                    }}
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      if (tool === "delete") {
+                        e.preventDefault();
+                        deleteImage(i+1, img.id);
+                        return;
+                      }
+                      if (tool !== "select") return;
+                      
+                      const startX = e.clientX;
+                      const startY = e.clientY;
+                      const startLeft = img.left;
+                      const startTop = img.top;
+                      let moved = false;
+                      
+                      const move = (ev) => {
+                        const dx = ev.clientX - startX;
+                        const dy = ev.clientY - startY;
+                        if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+                          moved = true;
+                        }
+                        if (moved) {
+                          const newLeft = startLeft + dx;
+                          const newTop = startTop + dy;
+                          updateImage(i+1, img.id, { 
+                            left: newLeft, 
+                            top: newTop 
+                          });
+                        }
+                      };
+                      
+                      const up = async () => {
+                        window.removeEventListener("mousemove", move);
+                        window.removeEventListener("mouseup", up);
+                        if (moved) {
+                          // Re-embed after drag ends
+                          setTimeout(async () => {
+                            await rebuildPdfWithAllContent(boxes, images);
+                          }, 100);
+                        }
+                      };
+                      
+                      window.addEventListener("mousemove", move);
+                      window.addEventListener("mouseup", up);
+                    }}
+                  >
+                    <img
+                      src={img.imageUrl}
+                      alt="PDF annotation"
+                      style={{
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        pointerEvents: 'none',
+                      }}
+                      draggable={false}
+                    />
+                    {/* Resize handles when selected */}
+                    {isSelected && (
+                      <>
+                        {/* Bottom-right resize handle */}
+                        <div
+                          style={{
+                            position: 'absolute',
+                            right: -5,
+                            bottom: -5,
+                            width: 10,
+                            height: 10,
+                            backgroundColor: '#1976d2',
+                            border: '2px solid white',
+                            borderRadius: '50%',
+                            cursor: 'nwse-resize',
+                            zIndex: 41,
+                          }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            const startX = e.clientX;
+                            const startY = e.clientY;
+                            const startWidth = img.width;
+                            const startHeight = img.height;
+                            const aspectRatio = startWidth / startHeight;
+                            
+                            const move = (ev) => {
+                              const dx = ev.clientX - startX;
+                              const dy = ev.clientY - startY;
+                              const newWidth = Math.max(50, startWidth + dx);
+                              const newHeight = newWidth / aspectRatio;
+                              updateImage(i+1, img.id, { 
+                                width: newWidth, 
+                                height: newHeight 
+                              });
+                            };
+                            
+                            const up = async () => {
+                              window.removeEventListener("mousemove", move);
+                              window.removeEventListener("mouseup", up);
+                              setTimeout(async () => {
+                                await rebuildPdfWithAllContent(boxes, images);
+                              }, 100);
+                            };
+                            
+                            window.addEventListener("mousemove", move);
+                            window.addEventListener("mouseup", up);
+                          }}
+                        />
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+
+              <div
+                className="annotation-layer"
+                onClick={(e) => {
+                  if (tool === "text") {
+                    addTextBox(i+1, e);
+                  } else if (tool === "image") {
+                    addImage(i+1, e);
+                  }
+                }}
+                style={{
+                  cursor: tool === "image" ? "crosshair" : tool === "text" ? "text" : "default",
+                }}
+              >
+                {(boxes[i+1] || []).map((b) => {
+                  const boxFontSize = b.fontSize || Number(fontSizeInput) || 12;
+                  const boxColor = b.color || fontColorHex;
+                  const boxIsBold = b.isBold !== undefined ? b.isBold : boldToggle;
+                  
+                  return (
+                  <div
+                    key={b.id}
+                    ref={(el) => { if (el) textBoxRefs.current[b.id] = el; }}
+                    className="text-box"
+                    dir="ltr"
+                    style={{
+                      position: 'absolute',
+                      left:b.left, 
+                      top:b.top, 
+                      width:b.width, 
+                      height:b.height,
+                      opacity: b.locked ? 0.6 : 1,
+                      border: tool === "select" ? '2px dashed #1976d2' : '1px solid #ccc',
+                      padding: '2px 4px',
+                      fontSize: boxFontSize * scale,
+                      fontWeight: boxIsBold ? 700 : 400,
+                      color: boxColor,
+                      fontFamily: 'Helvetica, Arial, sans-serif',
+                      backgroundColor: 'transparent',
+                      outline: 'none',
+                      cursor: 'text',
+                      zIndex: 50,
+                      direction: 'ltr',
+                      textAlign: 'left',
+                      unicodeBidi: 'plaintext',
+                      whiteSpace: 'pre-wrap',
+                      writingMode: 'horizontal-tb',
+                      borderRadius: 4,
+                      boxSizing: "border-box",
+                    }}
+                    contentEditable
+                    suppressContentEditableWarning
+                    tabIndex={0}
+                    onFocus={(e) => {
+                      setActiveBoxId(b.id);
+                      activeBoxIdRef.current = b.id;
+                      lock(b.id);
+                      const node = e.currentTarget.firstChild;
+                      const len = node?.textContent?.length || 0;
+                      rememberCaret(b.id, len);
+                      restoreCaret(b.id);
+                    }}
+                    onBlur={async () => {
+                      setActiveBoxId(cur => (cur === b.id ? null : cur));
+                      activeBoxIdRef.current = null;
+                      unlock(b.id);
+                      // Embed text box into PDF when done editing
+                      const finalText = textBoxRefs.current[b.id]?.textContent || "";
+                      if (finalText.trim() && finalText !== "Type...") {
+                        // Embed text into PDF first, then remove box from UI
+                        setTimeout(async () => {
+                          await rebuildPdfWithAllContent(boxes, images);
+                          // Remove the box from UI after text is embedded
+                          setBoxes(prev => {
+                            const pageBoxes = prev[i + 1] || [];
+                            const remaining = pageBoxes.filter(bx => bx.id !== b.id);
+                            return { ...prev, [i + 1]: remaining };
+                          });
+                          socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
+                        }, 200);
+                      } else {
+                        // If empty, just remove the box immediately
                         setBoxes(prev => {
                           const pageBoxes = prev[i + 1] || [];
                           const remaining = pageBoxes.filter(bx => bx.id !== b.id);
                           return { ...prev, [i + 1]: remaining };
                         });
                         socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
-                      }, 200);
-                    } else {
-                      // If empty, just remove the box immediately
-                      setBoxes(prev => {
-                        const pageBoxes = prev[i + 1] || [];
-                        const remaining = pageBoxes.filter(bx => bx.id !== b.id);
-                        return { ...prev, [i + 1]: remaining };
-                      });
-                      socketRef.current?.emit("delete_box", { docId, pageNumber: i + 1, boxId: b.id });
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      e.currentTarget.blur(); // This triggers onBlur which saves the text
-                    }
-                  }}
-                  onMouseDown={(e) => {
-                    if (tool === "delete") {
-                      e.preventDefault();
-                      deleteBox(i+1, b.id);
-                      return;
-                    }
-                    if (tool !== "select") return;
-                    const startX = e.clientX, startY = e.clientY;
-                    let moved = false;
-                    const move = (ev) => {
-                      const dx = ev.clientX - startX, dy = ev.clientY - startY;
-                      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
-                      if (moved) {
-                        const pageBoxes = boxes[i + 1] || [];
-                        const bi = pageBoxes.findIndex(bx => bx.id === b.id);
-                        const start = { ...pageBoxes[bi] };
-                        const updated = { ...start, left: start.left + dx, top: start.top + dy };
-                        const clone = [...pageBoxes]; clone[bi] = updated;
-                        setBoxes(prev => ({ ...prev, [i + 1]: clone }));
                       }
-                    };
-                    const up = async () => {
-                      window.removeEventListener("mousemove", move);
-                      window.removeEventListener("mouseup", up);
-                      if (moved) {
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
                         e.preventDefault();
-                        // Re-embed after moving
-                        setTimeout(async () => {
-                          await rebuildPdfWithAllContent(boxes, images);
-                        }, 100);
+                        e.currentTarget.blur(); // This triggers onBlur which saves the text
                       }
-                    };
-                    window.addEventListener("mousemove", move);
-                    window.addEventListener("mouseup", up);
-                  }}
-                  onInput={(e) => {
-                    const selection = window.getSelection();
-                    if (selection && selection.rangeCount > 0) {
-                      try {
-                        const range = selection.getRangeAt(0);
-                        rememberCaret(b.id, range.endOffset);
-                      } catch {}
-                    }
-                    const pageBoxes = boxes[i + 1] || [];
-                    const idx = pageBoxes.findIndex(x => x.id === b.id);
-                    const clone = [...pageBoxes];
-                    clone[idx] = { ...clone[idx], text: e.currentTarget.textContent || "" };
-                    setBoxes(prev => ({ ...prev, [i + 1]: clone }));
-                    requestAnimationFrame(() => {
-                      if (activeBoxIdRef.current === b.id) restoreCaret(b.id, false);
-                    });
-                  }}
-                >
-                  {b.text}
-                </div>
-              );
-              })}
+                    }}
+                    onMouseDown={(e) => {
+                      if (tool === "delete") {
+                        e.preventDefault();
+                        deleteBox(i+1, b.id);
+                        return;
+                      }
+                      if (tool !== "select") return;
+                      const startX = e.clientX, startY = e.clientY;
+                      let moved = false;
+                      const move = (ev) => {
+                        const dx = ev.clientX - startX, dy = ev.clientY - startY;
+                        if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+                        if (moved) {
+                          const pageBoxes = boxes[i + 1] || [];
+                          const bi = pageBoxes.findIndex(bx => bx.id === b.id);
+                          const start = { ...pageBoxes[bi] };
+                          const updated = { ...start, left: start.left + dx, top: start.top + dy };
+                          const clone = [...pageBoxes]; clone[bi] = updated;
+                          setBoxes(prev => ({ ...prev, [i + 1]: clone }));
+                        }
+                      };
+                      const up = async () => {
+                        window.removeEventListener("mousemove", move);
+                        window.removeEventListener("mouseup", up);
+                        if (moved) {
+                          e.preventDefault();
+                          // Re-embed after moving
+                          setTimeout(async () => {
+                            await rebuildPdfWithAllContent(boxes, images);
+                          }, 100);
+                        }
+                      };
+                      window.addEventListener("mousemove", move);
+                      window.addEventListener("mouseup", up);
+                    }}
+                    onInput={(e) => {
+                      const selection = window.getSelection();
+                      if (selection && selection.rangeCount > 0) {
+                        try {
+                          const range = selection.getRangeAt(0);
+                          rememberCaret(b.id, range.endOffset);
+                        } catch {}
+                      }
+                      const pageBoxes = boxes[i + 1] || [];
+                      const idx = pageBoxes.findIndex(x => x.id === b.id);
+                      const clone = [...pageBoxes];
+                      clone[idx] = { ...clone[idx], text: e.currentTarget.textContent || "" };
+                      setBoxes(prev => ({ ...prev, [i + 1]: clone }));
+                      requestAnimationFrame(() => {
+                        if (activeBoxIdRef.current === b.id) restoreCaret(b.id, false);
+                      });
+                    }}
+                  >
+                    {b.text}
+                  </div>
+                );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
-      </Document>
+          ))}
+        </Document>
+      </div>
     </div>
   );
 }
