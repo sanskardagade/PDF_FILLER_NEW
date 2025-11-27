@@ -806,16 +806,16 @@ export default function PdfEditor({ fileUrl, docId }) {
     const rect = wrap.getBoundingClientRect();
     const left = e.clientX - rect.left;
     const top  = e.clientY - rect.top;
-    const inferred = inferFontStyleFromNearbyText(pageNumber, left, top);
+
     createTextBox({
       pageNumber,
       left,
       top,
-      fontSize: inferred.fontSize,
-      color: inferred.color,
-      isBold: inferred.isBold,
-      compact: true,
+      fontSize: Number(fontSizeInput) || 12,
+      color: fontColorHex,
+      isBold: boldToggle,
       anchorExact: true,
+      compact: true,
     });
   };
 
@@ -878,12 +878,13 @@ export default function PdfEditor({ fileUrl, docId }) {
             const { r, g, b } = hexToRgb01(boxColor);
             const textColor = rgb(r, g, b);
             const font = await pdfDoc.embedFont(boxIsBold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica);
-            const paddingX = 4;
-            const paddingY = 2;
-            const pdfX = (box.left + paddingX) / scale;
-            const pdfTop = pageHeight - ((box.top + paddingY) / scale);
-            const baselineY = pdfTop - boxFontSize;
-            // Draw text in PDF at the same visual position as the editable box
+            
+            // Convert screen top-left to PDF baseline coordinates
+            const pdfX = box.left / scale;
+            const baselineYRaw = pageHeight - (box.top / scale) - boxFontSize;
+            const baselineY = Math.max(0, Math.min(pageHeight, baselineYRaw));
+
+            // Draw text in PDF at the same apparent location
             page.drawText(box.text, {
               x: pdfX,
               y: baselineY,
@@ -1590,7 +1591,7 @@ export default function PdfEditor({ fileUrl, docId }) {
                           minWidth: widthPx,
                           minHeight: heightPx,
                           outline: 'none',
-                          backgroundColor: 'transparent',
+                          backgroundColor: editOverlayBgHex,
                           borderRadius: 2,
                           boxShadow: '0 0 0 1px rgba(0,0,0,0.08)',
                           fontSize: item.fontSize * scale,
