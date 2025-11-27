@@ -56,6 +56,7 @@ export default function PdfEditor({ fileUrl, docId }) {
   const caretPositionsRef = useRef({});
   const [activeBoxId, setActiveBoxId] = useState(null);
   const activeBoxIdRef = useRef(null);
+  const [editOverlayBgHex, setEditOverlayBgHex] = useState('#ffffff');
 
   // Ensure we always have valid PDF bytes for pdf-lib
   async function ensurePdfBytes() {
@@ -605,10 +606,16 @@ export default function PdfEditor({ fileUrl, docId }) {
     return DEFAULT_PAGE_SIZE;
   };
 
-  const getBoxDimensions = (fontSize) => {
+  const getBoxDimensions = (fontSize, { compact=false } = {}) => {
     const resolved = Math.max(6, fontSize || Number(fontSizeInput) || 12);
+    if (compact) {
+      return {
+        width: Math.max(80, resolved * 4),
+        height: resolved + 6,
+      };
+    }
     return {
-      width: Math.max(180, resolved * 10),
+      width: Math.max(140, resolved * 6),
       height: resolved + 8,
     };
   };
@@ -674,16 +681,21 @@ export default function PdfEditor({ fileUrl, docId }) {
     }, 50);
   };
 
-  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text }) => {
+  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text, anchorExact=false, compact=false }) => {
     const resolvedFontSize = Math.max(6, fontSize || Number(fontSizeInput) || 12);
-    const dims = getBoxDimensions(resolvedFontSize);
+    const dims = getBoxDimensions(resolvedFontSize, { compact });
     const boxWidth = width || dims.width;
     const boxHeight = height || dims.height;
     const wrap = wrapperRefs.current[pageNumber];
     const maxWidth = wrap?.clientWidth || boxWidth;
     const maxHeight = wrap?.clientHeight || boxHeight;
-    const normalizedLeft = Math.min(Math.max(0, left - boxWidth / 2), Math.max(0, maxWidth - boxWidth));
-    const normalizedTop = Math.min(Math.max(0, top - (boxHeight * 0.75)), Math.max(0, maxHeight - boxHeight));
+    const clamp = (val, maxBound) => Math.min(Math.max(0, val), Math.max(0, maxBound));
+    const normalizedLeft = anchorExact
+      ? clamp(left, maxWidth - boxWidth)
+      : clamp(left - boxWidth / 2, maxWidth - boxWidth);
+    const normalizedTop = anchorExact
+      ? clamp(top, maxHeight - boxHeight)
+      : clamp(top - (boxHeight * 0.75), maxHeight - boxHeight);
     const box = {
       id: crypto.randomUUID(),
       left: normalizedLeft,
@@ -781,6 +793,8 @@ export default function PdfEditor({ fileUrl, docId }) {
       fontSize: style.fontSize,
       color: style.color,
       isBold: style.isBold,
+      compact: true,
+      anchorExact: true,
     });
   };
 
@@ -792,14 +806,16 @@ export default function PdfEditor({ fileUrl, docId }) {
     const rect = wrap.getBoundingClientRect();
     const left = e.clientX - rect.left;
     const top  = e.clientY - rect.top;
-
+    const inferred = inferFontStyleFromNearbyText(pageNumber, left, top);
     createTextBox({
       pageNumber,
       left,
       top,
-      fontSize: Number(fontSizeInput) || 12,
-      color: fontColorHex,
-      isBold: boldToggle,
+      fontSize: inferred.fontSize,
+      color: inferred.color,
+      isBold: inferred.isBold,
+      compact: true,
+      anchorExact: true,
     });
   };
 
@@ -862,15 +878,15 @@ export default function PdfEditor({ fileUrl, docId }) {
             const { r, g, b } = hexToRgb01(boxColor);
             const textColor = rgb(r, g, b);
             const font = await pdfDoc.embedFont(boxIsBold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica);
-            
-            // Convert screen coordinates to PDF coordinates
-            const pdfX = box.left / scale;
-            const pdfY = pageHeight - (box.top / scale) - (box.height / scale);
-            
-            // Draw text in PDF
+            const paddingX = 4;
+            const paddingY = 2;
+            const pdfX = (box.left + paddingX) / scale;
+            const pdfTop = pageHeight - ((box.top + paddingY) / scale);
+            const baselineY = pdfTop - boxFontSize;
+            // Draw text in PDF at the same visual position as the editable box
             page.drawText(box.text, {
               x: pdfX,
-              y: pdfY + boxFontSize, // Adjust for baseline
+              y: baselineY,
               size: boxFontSize,
               font,
               color: textColor,
@@ -1409,6 +1425,28 @@ export default function PdfEditor({ fileUrl, docId }) {
     activeBoxIdRef.current = activeBoxId;
   }, [activeBoxId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function hydrateBackground() {
+      if (!editBlock) {
+        setEditOverlayBgHex('#ffffff');
+        return;
+      }
+      try {
+        const sampled = await sampleBackgroundColorForItem(editBlock.pageNumber || 1, editBlock.item);
+        if (!cancelled && sampled) {
+          setEditOverlayBgHex(rgbToHex(sampled.r, sampled.g, sampled.b));
+        } else if (!cancelled) {
+          setEditOverlayBgHex('#ffffff');
+        }
+      } catch {
+        if (!cancelled) setEditOverlayBgHex('#ffffff');
+      }
+    }
+    hydrateBackground();
+    return () => { cancelled = true; };
+  }, [editBlock]);
+
   // Intentionally do not bind to native text layer clicks.
   // We open editors only via our invisible overlay rectangles, which
   // are derived from pdf.js text extraction and thus have stable
@@ -1535,7 +1573,14 @@ export default function PdfEditor({ fileUrl, docId }) {
                     />
                   )}
                   {isThisEditing && (
-                    <div style={{ position: 'absolute', left: leftPx, top: topPx - (0.15 * heightPx), zIndex: 35 }}>
+                    <div
+                      style={{
+                        position: 'absolute',
+                        left: leftPx,
+                        top: Math.max(0, topPx - heightPx),
+                        zIndex: 35,
+                      }}
+                    >
                       <div
                         ref={inlineEditorRef}
                         contentEditable
@@ -1544,10 +1589,12 @@ export default function PdfEditor({ fileUrl, docId }) {
                         style={{
                           minWidth: widthPx,
                           minHeight: heightPx,
-                          outline: '2px dashed #1976d2',
-                          background: 'transparent',
+                          outline: 'none',
+                          backgroundColor: 'transparent',
+                          borderRadius: 2,
+                          boxShadow: '0 0 0 1px rgba(0,0,0,0.08)',
                           fontSize: item.fontSize * scale,
-                          lineHeight: 1.1,
+                          lineHeight: `${item.fontSize * scale}px`,
                           fontFamily: 'Helvetica, Arial, sans-serif',
                           color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
                           padding: '2px 4px',
@@ -1556,6 +1603,7 @@ export default function PdfEditor({ fileUrl, docId }) {
                           unicodeBidi: 'plaintext',
                           whiteSpace: 'pre-wrap',
                           writingMode: 'horizontal-tb',
+                          caretColor: '#1976d2',
                         }}
                         onBlur={(e)=>{
                           handleSaveTextEditInline();
@@ -1566,6 +1614,9 @@ export default function PdfEditor({ fileUrl, docId }) {
                             handleSaveTextEditInline();
                           } else if (e.key==='Escape') {
                             setEditBlock(null);
+                          } else if (e.key === 'Delete') {
+                            e.preventDefault();
+                            handleDeleteTextInline();
                           }
                         }}
                         dangerouslySetInnerHTML={{ __html: (
@@ -1575,19 +1626,6 @@ export default function PdfEditor({ fileUrl, docId }) {
                           escapeHtml(item.str)
                         ) }}
                       />
-                      <button
-                        onClick={(ev) => { ev.stopPropagation(); handleDeleteTextInline(); }}
-                        title="Delete text"
-                        style={{
-                          marginLeft: 6,
-                          background: '#d32f2f',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: 4,
-                          padding: '2px 6px',
-                          cursor: 'pointer',
-                        }}
-                      >Delete</button>
                     </div>
                   )}
                 </div>
