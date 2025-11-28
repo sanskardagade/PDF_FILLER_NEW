@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import { io } from "socket.io-client";
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
@@ -10,8 +10,27 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { loadDoc, saveDoc, uploadPdfBlob, uploadImageBlob } from "../api/docApi";
 
-const SOCKET_URL = import.meta.env.VITE_API_BASE || "https://pdf-filler-new.onrender.com";
+const SOCKET_URL = import.meta.env.VITE_API_BASE || "http://localhost:4000";
 const DEFAULT_PAGE_SIZE = { width: 595, height: 842 };
+const LINE_MERGE_TOLERANCE = 2; // PDF units (~2pt)
+
+const sanitizeTextForStandardFont = (text = "") => {
+  const fallbackMap = {
+    '●': '*',
+    '•': '*',
+    '–': '-',
+    '—': '-',
+    '’': "'",
+    '‘': "'",
+    '“': '"',
+    '”': '"',
+  };
+  return Array.from(text).map((ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code <= 255) return ch;
+    return fallbackMap[ch] || '?';
+  }).join('');
+};
 
 // small throttle helper so drag updates don't spam
 const throttle = (fn, ms=30) => {
@@ -27,6 +46,146 @@ const throttle = (fn, ms=30) => {
   };
 };
 
+const mergeSpansIntoLines = (spans = [], pageNumber) => {
+  if (!spans.length) return [];
+  const sorted = [...spans].sort((a, b) => {
+    const yDiff = Math.abs((a.y || 0) - (b.y || 0));
+    if (yDiff <= LINE_MERGE_TOLERANCE) return (a.x || 0) - (b.x || 0);
+    return (b.y || 0) - (a.y || 0);
+  });
+
+  const lines = [];
+  sorted.forEach((span) => {
+    let current = lines[lines.length - 1];
+    const sameLine = current && Math.abs((current.y || 0) - (span.y || 0)) <= LINE_MERGE_TOLERANCE;
+    if (!current || !sameLine) {
+      current = {
+        id: `page-${pageNumber}-line-${lines.length}`,
+        pageNumber,
+        x: span.x,
+        y: span.y,
+        width: span.width,
+        height: span.height,
+        fontSize: span.fontSize,
+        isBold: span.isBold,
+        isItalic: span.isItalic,
+        color: span.color,
+        text: "",
+        spans: [],
+      };
+      lines.push(current);
+    }
+
+    if (current.text && span.text && !span.text.startsWith(" ")) {
+      current.text += " ";
+    }
+
+    current.text += span.text || "";
+    current.spans.push(span);
+    const spanRight = (span.x || 0) + (span.width || 0);
+    current.x = Math.min(current.x, span.x);
+    current.width = Math.max(current.width, spanRight - current.x);
+    current.height = Math.max(current.height, span.height || current.height);
+    current.fontSize = Math.max(current.fontSize, span.fontSize || current.fontSize);
+    current.isBold = current.isBold || span.isBold;
+    current.isItalic = current.isItalic || span.isItalic;
+  });
+
+  return lines;
+};
+
+const hydrateDocumentTextLinesFactory = ({
+  pdfjsLib,
+  mergeSpansIntoLines,
+  setPageSizes,
+  setPdfTextItems,
+  setTextLinesByPage,
+}) => async (pdfArrayBuffer, target = 'all') => {
+  try {
+    const normalizeColorValue = (val) => {
+      const num = typeof val === 'number' ? val : parseFloat(val);
+      if (isNaN(num)) return 0;
+      return Math.max(0, Math.min(1, num));
+    };
+    const data = pdfArrayBuffer instanceof Uint8Array ? pdfArrayBuffer : new Uint8Array(pdfArrayBuffer);
+    const pdf = await pdfjsLib.getDocument({ data }).promise;
+    const totalPages = pdf.numPages;
+    const targets = target === 'all'
+      ? Array.from({ length: totalPages }, (_, idx) => idx + 1)
+      : Array.isArray(target) ? target : [target];
+
+    const spansByPage = {};
+    const linesByPage = {};
+    const sizesByPage = {};
+
+    for (const pageNumber of targets) {
+      if (pageNumber < 1 || pageNumber > totalPages) continue;
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      sizesByPage[pageNumber] = { width: viewport.width, height: viewport.height };
+      const textContent = await page.getTextContent();
+      const ops = await page.getOperatorList();
+      let currentColor = { r: 0, g: 0, b: 0 };
+      for (let i = 0; i < ops.fnArray.length; i++) {
+        const op = ops.fnArray[i];
+        if (op === pdfjsLib.OPS.setFillRGBColor && ops.argsArray[i]?.length >= 3) {
+          currentColor = {
+            r: normalizeColorValue(ops.argsArray[i][0]),
+            g: normalizeColorValue(ops.argsArray[i][1]),
+            b: normalizeColorValue(ops.argsArray[i][2]),
+          };
+        } else if (op === pdfjsLib.OPS.setFillGrayColor && ops.argsArray[i]?.length >= 1) {
+          const gray = normalizeColorValue(ops.argsArray[i][0]);
+          currentColor = { r: gray, g: gray, b: gray };
+        } else if (op === pdfjsLib.OPS.setFillColorSpace) {
+          currentColor = { r: 0, g: 0, b: 0 };
+        }
+      }
+      const spans = textContent.items.map((item, idx) => {
+        const [, , , d, e, f] = item.transform;
+        const fontName = item.fontName || 'Helvetica';
+        const fontSize = Math.abs(d) || 12;
+        return {
+          id: `preload-${pageNumber}-${idx}`,
+          text: item.str || '',
+          x: e,
+          y: f,
+          width: item.width || fontSize,
+          height: item.height || fontSize,
+          fontSize,
+          isBold: /Bold|Semibold|Medium/gi.test(fontName),
+          isItalic: /Italic|Oblique/gi.test(fontName),
+          color: currentColor,
+        };
+      });
+      spansByPage[pageNumber] = spans;
+      linesByPage[pageNumber] = mergeSpansIntoLines(spans, pageNumber);
+    }
+
+    if (Object.keys(sizesByPage).length) {
+      setPageSizes((prev) => ({ ...prev, ...sizesByPage }));
+    }
+    if (Object.keys(spansByPage).length) {
+      setPdfTextItems((prev) => ({ ...prev, ...spansByPage }));
+    }
+    if (Object.keys(linesByPage).length) {
+      setTextLinesByPage((prev) => {
+        const next = { ...prev };
+        for (const [page, lines] of Object.entries(linesByPage)) {
+          const existing = prev[page] || [];
+          next[page] = lines.map((line, idx) => ({
+            ...line,
+            id: existing[idx]?.id || line.id,
+          }));
+        }
+        return next;
+      });
+    }
+  } catch (err) {
+    console.error('Failed to hydrate document text lines:', err);
+  }
+};
+
 export default function PdfEditor({ fileUrl, docId }) {
   const [numPages, setNumPages] = useState(null);
   const [scale, setScale] = useState(1.2);
@@ -37,9 +196,9 @@ export default function PdfEditor({ fileUrl, docId }) {
   const socketRef = useRef(null);
   const [pdfBuffer, setPdfBuffer] = useState(null); // Uint8Array for pdf-lib
   const [editedUrl, setEditedUrl] = useState(null); // Updated PDF fileUrl
-  const [showTextEdit, setShowTextEdit] = useState(false);
   const [editText, setEditText] = useState("");
-  const [pdfTextItems, setPdfTextItems] = useState({}); // PDF text with positions by page
+  const [pdfTextItems, setPdfTextItems] = useState({}); // Individual span measurements (from text layer)
+  const [textLinesByPage, setTextLinesByPage] = useState({});
   const [editBlock, setEditBlock] = useState(null); // {item, idx}
   const [boldToggle, setBoldToggle] = useState(false);
   const inlineEditorRef = useRef(null);
@@ -57,6 +216,21 @@ export default function PdfEditor({ fileUrl, docId }) {
   const [activeBoxId, setActiveBoxId] = useState(null);
   const activeBoxIdRef = useRef(null);
   const [editOverlayBgHex, setEditOverlayBgHex] = useState('#ffffff');
+  const scaleRef = useRef(scale);
+  const [activeLineEdit, setActiveLineEdit] = useState(null);
+  const [lineEditorValue, setLineEditorValue] = useState("");
+  const lineEditorValueRef = useRef("");
+
+  const hydrateDocumentTextLines = useMemo(
+    () => hydrateDocumentTextLinesFactory({
+      pdfjsLib,
+      mergeSpansIntoLines,
+      setPageSizes,
+      setPdfTextItems,
+      setTextLinesByPage,
+    }),
+    []
+  );
 
   // Ensure we always have valid PDF bytes for pdf-lib
   async function ensurePdfBytes() {
@@ -161,13 +335,16 @@ export default function PdfEditor({ fileUrl, docId }) {
       fetch(fileUrl).then(res => res.arrayBuffer()).then(buf => {
         const bytes = new Uint8Array(buf);
         setPdfBuffer(bytes);
-        // Clone bytes for history to avoid detached ArrayBuffer issues
         setHistory([{ bytes: new Uint8Array(bytes), url: fileUrl || null }]);
         setHistoryIndex(0);
-        extractTextItems(bytes, 'all');
+        hydrateDocumentTextLines(bytes, 'all');
       });
     }
-  }, [fileUrl]);
+  }, [fileUrl, hydrateDocumentTextLines]);
+
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
 
   // Auto-fit scale to wrapper width when a new document loads or page sizes change
   useEffect(() => {
@@ -196,9 +373,9 @@ export default function PdfEditor({ fileUrl, docId }) {
     fetch(editedUrl).then(res => res.arrayBuffer()).then(buf => {
       const bytes = new Uint8Array(buf);
       setPdfBuffer(bytes);
-      extractTextItems(bytes, 'all');
+      hydrateDocumentTextLines(bytes, 'all');
     }).catch(() => {});
-  }, [editedUrl]);
+  }, [editedUrl, hydrateDocumentTextLines]);
 
   // Function to extract text items (pageNum=1) with color information
   async function extractTextItems(pdfArrayBuffer, pageNum=1) {
@@ -360,6 +537,10 @@ export default function PdfEditor({ fileUrl, docId }) {
 
   // Inline save of edited block (cover old, write new) with original font, size, and color
   async function handleSaveTextEditInline(newStr) {
+    if (activeLineEdit) {
+      await persistLineEditToPdf(activeLineEdit, newStr ?? lineEditorValue);
+      return;
+    }
     if (!editBlock) return;
     const bytes = await ensurePdfBytes();
     const pdfDoc = await PDFDocument.load(bytes);
@@ -492,6 +673,10 @@ export default function PdfEditor({ fileUrl, docId }) {
   // Delete inline PDF text by covering the original text area with white
   // and saving the PDF. Mirrors the covering logic used when saving edits.
   async function handleDeleteTextInline() {
+    if (activeLineEdit) {
+      await persistLineEditToPdf(activeLineEdit, "");
+      return;
+    }
     if (!editBlock) return;
     const item = editBlock.item;
     try {
@@ -606,16 +791,10 @@ export default function PdfEditor({ fileUrl, docId }) {
     return DEFAULT_PAGE_SIZE;
   };
 
-  const getBoxDimensions = (fontSize, { compact=false } = {}) => {
+  const getBoxDimensions = (fontSize) => {
     const resolved = Math.max(6, fontSize || Number(fontSizeInput) || 12);
-    if (compact) {
-      return {
-        width: Math.max(80, resolved * 4),
-        height: resolved + 6,
-      };
-    }
     return {
-      width: Math.max(140, resolved * 6),
+      width: Math.max(180, resolved * 10),
       height: resolved + 8,
     };
   };
@@ -681,21 +860,16 @@ export default function PdfEditor({ fileUrl, docId }) {
     }, 50);
   };
 
-  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text, anchorExact=false, compact=false }) => {
+  const createTextBox = ({ pageNumber, left, top, fontSize, color, isBold, width, height, text }) => {
     const resolvedFontSize = Math.max(6, fontSize || Number(fontSizeInput) || 12);
-    const dims = getBoxDimensions(resolvedFontSize, { compact });
+    const dims = getBoxDimensions(resolvedFontSize);
     const boxWidth = width || dims.width;
     const boxHeight = height || dims.height;
     const wrap = wrapperRefs.current[pageNumber];
     const maxWidth = wrap?.clientWidth || boxWidth;
     const maxHeight = wrap?.clientHeight || boxHeight;
-    const clamp = (val, maxBound) => Math.min(Math.max(0, val), Math.max(0, maxBound));
-    const normalizedLeft = anchorExact
-      ? clamp(left, maxWidth - boxWidth)
-      : clamp(left - boxWidth / 2, maxWidth - boxWidth);
-    const normalizedTop = anchorExact
-      ? clamp(top, maxHeight - boxHeight)
-      : clamp(top - (boxHeight * 0.75), maxHeight - boxHeight);
+    const normalizedLeft = Math.min(Math.max(0, left - boxWidth / 2), Math.max(0, maxWidth - boxWidth));
+    const normalizedTop = Math.min(Math.max(0, top - (boxHeight * 0.75)), Math.max(0, maxHeight - boxHeight));
     const box = {
       id: crypto.randomUUID(),
       left: normalizedLeft,
@@ -712,6 +886,194 @@ export default function PdfEditor({ fileUrl, docId }) {
     focusNewTextBox(box.id);
     return box;
   };
+
+  const handleTextLayerRender = useCallback((pageNumber, textLayerDiv) => {
+    if (!textLayerDiv) return;
+    const wrapper = wrapperRefs.current[pageNumber];
+    if (!wrapper) return;
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const metrics = getPageMetrics(pageNumber);
+    const currentScale = scaleRef.current || scale || 1;
+    const spans = Array.from(textLayerDiv.querySelectorAll('span'));
+    const selection = window.getSelection();
+    const hasTextSelection = selection && !selection.isCollapsed;
+    if (hasTextSelection) return;
+    if (!spans.length) {
+      setPdfTextItems(prev => ({ ...prev, [pageNumber]: [] }));
+      setTextLinesByPage(prev => ({ ...prev, [pageNumber]: [] }));
+      return;
+    }
+
+    const spanData = spans.map((span, idx) => {
+      const rect = span.getBoundingClientRect();
+      const leftPx = rect.left - wrapperRect.left;
+      const topPx = rect.top - wrapperRect.top;
+      const widthPx = rect.width;
+      const heightPx = rect.height;
+      const x = leftPx / currentScale;
+      const yFromTop = topPx / currentScale;
+      const width = widthPx / currentScale;
+      const height = heightPx / currentScale;
+      const y = metrics.height - yFromTop;
+      const style = window.getComputedStyle(span);
+      const fontSizePx = parseFloat(style.fontSize || '12');
+      const fontSize = fontSizePx / currentScale;
+      const fontWeight = style.fontWeight || '400';
+      const fontStyle = style.fontStyle || 'normal';
+      return {
+        id: `p${pageNumber}-s${idx}`,
+        text: span.textContent || '',
+        x,
+        y,
+        width,
+        height,
+        fontSize,
+        isBold: parseInt(fontWeight, 10) >= 600 || fontWeight === 'bold',
+        isItalic: fontStyle === 'italic' || fontStyle === 'oblique',
+        color: { r: 0, g: 0, b: 0 },
+      };
+    });
+
+    const lines = mergeSpansIntoLines(spanData, pageNumber);
+    setPdfTextItems(prev => ({ ...prev, [pageNumber]: spanData }));
+    setTextLinesByPage(prev => {
+      const existing = prev[pageNumber] || [];
+      const merged = lines.map((line, idx) => {
+        const stableId = existing[idx]?.id || line.id;
+        return { ...line, id: stableId };
+      });
+      return { ...prev, [pageNumber]: merged };
+    });
+  }, [scale, pageSizes]);
+
+  const persistLineEditToPdf = useCallback(async (lineContext, newStr) => {
+    if (!lineContext) return;
+    const { pageNumber, line } = lineContext;
+    if (!line) return;
+    const targetText = sanitizeTextForStandardFont(newStr || "");
+    try {
+      const bytes = await ensurePdfBytes();
+      const pdfDoc = await PDFDocument.load(bytes);
+      const pageIndex = Math.max(0, Math.min(pageNumber - 1, pdfDoc.getPageCount() - 1));
+      const page = pdfDoc.getPages()[pageIndex];
+      if (!page) return;
+
+      const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+      const fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique).catch(() => fontRegular);
+      const fontBoldItalic = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique).catch(() => fontBold);
+      const fontToUse = line.isBold && line.isItalic
+        ? fontBoldItalic
+        : line.isBold
+          ? fontBold
+          : line.isItalic
+            ? fontItalic
+            : fontRegular;
+
+      const fontSize = Math.max(6, line.fontSize || 12);
+      const newTextWidth = fontToUse.widthOfTextAtSize(targetText || " ", fontSize);
+      const coverWidth = Math.max(line.width || newTextWidth, newTextWidth) + 2;
+      const coverHeight = (line.height || fontSize) * 1.1;
+      const coverY = line.y - (line.height || fontSize) * 0.2;
+
+      let coverColor = { r: 1, g: 1, b: 1 };
+      try {
+        const sampled = await sampleBackgroundColorForItem(pageNumber, {
+          x: line.x,
+          y: line.y,
+          width: line.width,
+          height: line.height || fontSize,
+        });
+        if (sampled) coverColor = sampled;
+      } catch {
+        // ignore sampling failures
+      }
+
+      page.drawRectangle({
+        x: line.x - 1,
+        y: coverY,
+        width: coverWidth,
+        height: coverHeight,
+        color: rgb(coverColor.r, coverColor.g, coverColor.b),
+        opacity: 1.0,
+      });
+
+      if (targetText) {
+        const normalize = (v) => {
+          if (typeof v !== "number") {
+            const parsed = parseFloat(v);
+            if (isNaN(parsed)) return 0;
+            return parsed > 1 ? parsed / 255 : parsed;
+          }
+          return v > 1 ? v / 255 : v;
+        };
+        const sourceColor = line.color || { r: 0, g: 0, b: 0 };
+        const textColor = rgb(
+          normalize(sourceColor.r),
+          normalize(sourceColor.g),
+          normalize(sourceColor.b)
+        );
+
+        page.drawText(targetText, {
+          x: line.x,
+          y: line.y,
+          size: fontSize,
+          font: fontToUse,
+          color: textColor,
+        });
+      }
+
+      const newBytes = await pdfDoc.save();
+      const blob = new Blob([newBytes], { type: 'application/pdf' });
+      try {
+        const { url } = await uploadPdfBlob(blob);
+        const absolute = `${SOCKET_URL}${url}?v=${Date.now()}`;
+        setEditedUrl(absolute);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, absolute);
+        if (docId) await saveDoc(docId, { boxes, images, pdfUrl: url });
+      } catch {
+        const objectUrl = URL.createObjectURL(blob);
+        setEditedUrl(objectUrl);
+        setPdfBuffer(newBytes);
+        pushHistory(newBytes, objectUrl);
+      }
+      setDocVersion((v) => v + 1);
+      setTextLinesByPage((prev) => {
+        const pageLines = prev[pageNumber] || [];
+        const idx = pageLines.findIndex((l) => l.id === line.id);
+        if (idx < 0) return prev;
+        const updated = [...pageLines];
+        updated[idx] = { ...updated[idx], text: targetText, str: targetText };
+        return { ...prev, [pageNumber]: updated };
+      });
+      setActiveLineEdit(null);
+      setLineEditorValue("");
+      await hydrateDocumentTextLines(new Uint8Array(newBytes), [pageNumber]);
+    } catch (err) {
+      console.error('Failed to persist inline edit:', err);
+    }
+  }, [boxes, images, docId, ensurePdfBytes, hydrateDocumentTextLines]);
+
+  const beginInlineLineEdit = useCallback((pageNumber, line, clickEvent) => {
+    if (!line) return;
+    clickEvent?.stopPropagation?.();
+    setActiveLineEdit({
+      pageNumber,
+      lineId: line.id,
+      bbox: {
+        x: line.x,
+        y: line.y,
+        width: line.width,
+        height: line.height || line.fontSize || 12,
+      },
+      line,
+    });
+    const initial = line.text || "";
+    setLineEditorValue(initial);
+    lineEditorValueRef.current = initial;
+    setEditBlock(null);
+  }, []);
 
   const isPointInExistingContent = (pageNumber, left, top) => {
     const pageBoxes = boxes[pageNumber] || [];
@@ -793,8 +1155,6 @@ export default function PdfEditor({ fileUrl, docId }) {
       fontSize: style.fontSize,
       color: style.color,
       isBold: style.isBold,
-      compact: true,
-      anchorExact: true,
     });
   };
 
@@ -814,8 +1174,6 @@ export default function PdfEditor({ fileUrl, docId }) {
       fontSize: Number(fontSizeInput) || 12,
       color: fontColorHex,
       isBold: boldToggle,
-      anchorExact: true,
-      compact: true,
     });
   };
 
@@ -879,15 +1237,14 @@ export default function PdfEditor({ fileUrl, docId }) {
             const textColor = rgb(r, g, b);
             const font = await pdfDoc.embedFont(boxIsBold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica);
             
-            // Convert screen top-left to PDF baseline coordinates
+            // Convert screen coordinates to PDF coordinates
             const pdfX = box.left / scale;
-            const baselineYRaw = pageHeight - (box.top / scale) - boxFontSize;
-            const baselineY = Math.max(0, Math.min(pageHeight, baselineYRaw));
-
-            // Draw text in PDF at the same apparent location
+            const pdfY = pageHeight - (box.top / scale) - (box.height / scale);
+            
+            // Draw text in PDF
             page.drawText(box.text, {
               x: pdfX,
-              y: baselineY,
+              y: pdfY + boxFontSize, // Adjust for baseline
               size: boxFontSize,
               font,
               color: textColor,
@@ -1402,7 +1759,7 @@ export default function PdfEditor({ fileUrl, docId }) {
 
   // focus inline editor when set
   useEffect(() => {
-    if (inlineEditorRef.current) {
+    if (inlineEditorRef.current && (editBlock || activeLineEdit)) {
       inlineEditorRef.current.focus();
       const range = document.createRange();
       range.selectNodeContents(inlineEditorRef.current);
@@ -1410,17 +1767,16 @@ export default function PdfEditor({ fileUrl, docId }) {
       const sel = window.getSelection();
       sel.removeAllRanges();
       sel.addRange(range);
-      // If the edited PDF text was bold/italic, enable typing in that style
       try {
-        const wasBold = editBlock && editBlock.item && editBlock.item.isBold;
-        const wasItalic = editBlock && editBlock.item && editBlock.item.isItalic;
-        if (wasBold) document.execCommand('bold');
-        if (wasItalic) document.execCommand('italic');
-      } catch (err) {
+        const boldSource = activeLineEdit?.line?.isBold || (editBlock && editBlock.item && editBlock.item.isBold);
+        const italicSource = activeLineEdit?.line?.isItalic || (editBlock && editBlock.item && editBlock.item.isItalic);
+        if (boldSource) document.execCommand('bold');
+        if (italicSource) document.execCommand('italic');
+      } catch {
         // ignore
       }
     }
-  }, [editBlock]);
+  }, [editBlock, activeLineEdit]);
 
   useEffect(() => {
     activeBoxIdRef.current = activeBoxId;
@@ -1540,98 +1896,120 @@ export default function PdfEditor({ fileUrl, docId }) {
               pageNumber={i + 1}
               scale={scale}
               renderAnnotationLayer={false}
-              renderTextLayer={false}
+              renderTextLayer
+              onRenderTextLayerSuccess={(layerDiv) => handleTextLayerRender(i + 1, layerDiv)}
             />
 
-            {/* Inline editor overlay for real text blocks */}
-            {(pdfTextItems[i+1] || []).map((item, idx) => {
+            {/* Transparent hit areas for native PDF lines */}
+            {(textLinesByPage[i+1] || []).map((line) => {
               const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
-              const topPx = (pageMetrics.height - item.y) * scale;
-              const leftPx = item.x * scale;
-              const heightPx = (item.height || item.fontSize) * scale;
-              const widthPx = (item.width || item.fontSize || 12) * scale;
-              const isThisEditing = editBlock && editBlock.idx === idx;
+              const topPx = (pageMetrics.height - line.y) * scale;
+              const leftPx = line.x * scale;
+              const heightPx = (line.height || line.fontSize || 12) * scale;
+              const widthPx = (line.width || (line.text?.length || 1) * (line.fontSize || 12) * 0.6) * scale;
               return (
-                <div key={idx}>
-                  {!isThisEditing && (
-                    <div
-                      title={item.str}
-                      style={{
-                        position: 'absolute',
-                        left: leftPx,
-                        top: topPx,
-                        width: widthPx,
-                        height: heightPx,
-                        opacity: 0,
-                        cursor: 'text',
-                        pointerEvents: 'auto',
-                        zIndex: 30,
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setEditBlock({item, idx, pageNumber: i+1});
-                      }}
-                    />
-                  )}
-                  {isThisEditing && (
-                    <div
-                      style={{
-                        position: 'absolute',
-                        left: leftPx,
-                        top: Math.max(0, topPx - heightPx),
-                        zIndex: 35,
-                      }}
-                    >
-                      <div
-                        ref={inlineEditorRef}
-                        contentEditable
-                        suppressContentEditableWarning
-                        dir="ltr"
-                        style={{
-                          minWidth: widthPx,
-                          minHeight: heightPx,
-                          outline: 'none',
-                          backgroundColor: editOverlayBgHex,
-                          borderRadius: 2,
-                          boxShadow: '0 0 0 1px rgba(0,0,0,0.08)',
-                          fontSize: item.fontSize * scale,
-                          lineHeight: `${item.fontSize * scale}px`,
-                          fontFamily: 'Helvetica, Arial, sans-serif',
-                          color: item.color ? rgbToHex(item.color.r, item.color.g, item.color.b) : '#000000',
-                          padding: '2px 4px',
-                          direction: 'ltr',
-                          textAlign: 'left',
-                          unicodeBidi: 'plaintext',
-                          whiteSpace: 'pre-wrap',
-                          writingMode: 'horizontal-tb',
-                          caretColor: '#1976d2',
-                        }}
-                        onBlur={(e)=>{
-                          handleSaveTextEditInline();
-                        }}
-                        onKeyDown={(e)=>{
-                          if(e.key==='Enter') {
-                            e.preventDefault();
-                            handleSaveTextEditInline();
-                          } else if (e.key==='Escape') {
-                            setEditBlock(null);
-                          } else if (e.key === 'Delete') {
-                            e.preventDefault();
-                            handleDeleteTextInline();
-                          }
-                        }}
-                        dangerouslySetInnerHTML={{ __html: (
-                          item.isBold && item.isItalic ? ('<b><i>' + escapeHtml(item.str) + '</i></b>') :
-                          item.isBold ? ('<b>' + escapeHtml(item.str) + '</b>') :
-                          item.isItalic ? ('<i>' + escapeHtml(item.str) + '</i>') :
-                          escapeHtml(item.str)
-                        ) }}
-                      />
-                    </div>
-                  )}
-                </div>
+                <div
+                  key={line.id}
+                  style={{
+                    position: 'absolute',
+                    left: leftPx,
+                    top: topPx - (heightPx * 0.8),
+                    width: Math.max(widthPx, 2),
+                    height: Math.max(heightPx * 1.2, 12),
+                    backgroundColor: 'rgba(25,118,210,0.15)',
+                    border: '1px dashed rgba(25,118,210,0.4)',
+                    opacity: activeLineEdit && activeLineEdit.lineId === line.id ? 0.8 : 0,
+                    cursor: 'text',
+                    pointerEvents: 'auto',
+                    zIndex: 25,
+                    transition: 'opacity 120ms ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.opacity = '0.35';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!activeLineEdit || activeLineEdit.lineId !== line.id) {
+                      e.currentTarget.style.opacity = '0';
+                    }
+                  }}
+                  onClick={(e) => beginInlineLineEdit(i + 1, line, e)}
+                />
               );
             })}
+
+            {/* Inline editor overlay when editing a real PDF line */}
+            {activeLineEdit && activeLineEdit.pageNumber === i + 1 && (() => {
+              const { bbox, line } = activeLineEdit;
+              const pageMetrics = pageSizes[i+1] || pageSizes[1] || DEFAULT_PAGE_SIZE;
+              const baselineTopPx = (pageMetrics.height - bbox.y) * scale;
+              const leftPx = bbox.x * scale;
+              const heightPx = (bbox.height || line.fontSize || 12) * scale;
+              const overlayTopPx = baselineTopPx - (heightPx * 0.8);
+              return (
+                <div
+                  key="line-editor"
+                  style={{
+                    position: 'absolute',
+                    left: leftPx,
+                    top: Math.max(0, overlayTopPx),
+                    zIndex: 40,
+                    minWidth: Math.max(60, bbox.width * scale),
+                  }}
+                >
+                  <div
+                    ref={inlineEditorRef}
+                    contentEditable
+                    suppressContentEditableWarning
+                    dir="ltr"
+                    style={{
+                      minWidth: Math.max(60, bbox.width * scale),
+                      minHeight: heightPx,
+                      outline: 'none',
+                      backgroundColor: editOverlayBgHex,
+                      borderRadius: 2,
+                      boxShadow: '0 0 0 1px rgba(0,0,0,0.1)',
+                      fontSize: (line.fontSize || 12) * scale,
+                      lineHeight: `${(line.fontSize || 12) * scale}px`,
+                      fontFamily: 'Helvetica, Arial, sans-serif',
+                      color: line.color ? rgbToHex(line.color.r, line.color.g, line.color.b) : '#000000',
+                      padding: '2px 4px',
+                      direction: 'ltr',
+                      textAlign: 'left',
+                      unicodeBidi: 'plaintext',
+                      whiteSpace: 'pre-wrap',
+                      writingMode: 'horizontal-tb',
+                      caretColor: '#1976d2',
+                    }}
+                    onInput={(e) => {
+                      const val = e.currentTarget.textContent || "";
+                      lineEditorValueRef.current = val;
+                    }}
+                    onBlur={(e)=>{
+                      const val = lineEditorValueRef.current || e.currentTarget.textContent || "";
+                      setLineEditorValue(val);
+                      handleSaveTextEditInline(val);
+                      setActiveLineEdit(null);
+                    }}
+                    onKeyDown={(e)=>{
+                      if(e.key==='Enter') {
+                        e.preventDefault();
+                        const val = lineEditorValueRef.current || inlineEditorRef.current?.textContent || "";
+                        setLineEditorValue(val);
+                        handleSaveTextEditInline(val);
+                        setActiveLineEdit(null);
+                      } else if (e.key==='Escape') {
+                        setActiveLineEdit(null);
+                      } else if (e.key === 'Delete' && !(lineEditorValueRef.current || "").length) {
+                        e.preventDefault();
+                        handleDeleteTextInline();
+                      }
+                    }}
+                  >
+                    {lineEditorValueRef.current}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Image overlay layer */}
             {(images[i+1] || []).map((img) => {
